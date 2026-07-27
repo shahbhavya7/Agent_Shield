@@ -1,0 +1,942 @@
+"use client";
+
+import Link from "next/link";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+  ShieldCheck,
+  AlertTriangle,
+  Wrench,
+  Clock,
+  PlayCircle,
+  Tag,
+  ShieldAlert,
+  Layers,
+  RefreshCcw,
+  ScanSearch,
+  SlidersHorizontal,
+  Bot,
+  Link2,
+  KeyRound,
+  Sparkles,
+  Gem,
+  Plug,
+  CheckCircle2,
+  Loader2,
+  Circle,
+  ArrowRight,
+  RotateCcw,
+  Coins,
+  Cpu,
+  Copy,
+  Check,
+  Upload,
+  FileText,
+  X,
+} from "lucide-react";
+import {
+  createRun,
+  discoverAgent,
+  getReport,
+  getRun,
+  getDemoReport,
+  probeAgent,
+  registerAgent,
+  type Message,
+  type Report,
+  type RunCounts,
+  type Trace,
+} from "../lib/api";
+
+const PROVIDERS = [
+  { id: "openai", label: "OpenAI", icon: Sparkles },
+  { id: "anthropic", label: "Anthropic", icon: ShieldCheck },
+  { id: "gemini", label: "Gemini", icon: Gem },
+  { id: "custom", label: "Custom Endpoint", icon: Plug },
+];
+
+// Each UI category maps to one of the backend test_type keys.
+const TEST_CATEGORIES = [
+  { label: "Prompt Injection", icon: ShieldAlert, type: "injection" },
+  { label: "Hallucination", icon: AlertTriangle, type: "hallucination" },
+  { label: "Tool Failure", icon: Wrench, type: "support" },
+  { label: "Memory Recall", icon: Layers, type: "memory" },
+  { label: "Contradiction", icon: ScanSearch, type: "contradiction" },
+  { label: "API / System Failure", icon: Clock, type: "system_failure" },
+];
+
+const VERIFICATION_STEPS = [
+  "Registering agent…",
+  "Resolving endpoint…",
+  "Sending live test request…",
+  "Receiving response…",
+  "Agent connected successfully.",
+];
+
+const WIZARD_STEPS: Step[] = ["connect", "verifying", "configure", "running"];
+const STEP_LABELS: Record<Step, string> = {
+  connect: "Connect",
+  verifying: "Verify",
+  configure: "Configure",
+  running: "Test",
+  results: "Results",
+};
+
+const RING_RADIUS = 70;
+const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
+
+const shapes = [
+  { size: 190, top: "-6%", left: "-4%", color: "#7C5CFF", radius: "42% 58% 70% 30% / 45% 45% 55% 55%", rotate: 10, duration: 20, delay: 0 },
+  { size: 110, top: "20%", left: "88%", color: "#2DD4BF", radius: "63% 37% 30% 70% / 50% 45% 55% 50%", rotate: -12, duration: 15, delay: 1 },
+  { size: 160, top: "70%", left: "-4%", color: "#F472B6", radius: "37% 63% 56% 44% / 49% 56% 44% 51%", rotate: 16, duration: 22, delay: 0.5 },
+  { size: 90, top: "55%", left: "72%", color: "#FBBF24", radius: "73% 27% 45% 55% / 39% 49% 51% 61%", rotate: -14, duration: 13, delay: 1.5 },
+];
+
+type Step = "connect" | "verifying" | "configure" | "running" | "results";
+
+const fadeStep = {
+  initial: { opacity: 0, y: 16 },
+  animate: { opacity: 1, y: 0 },
+  exit: { opacity: 0, y: -16 },
+  transition: { duration: 0.4, ease: "easeOut" as const },
+};
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function prettify(type?: string): string {
+  const map: Record<string, string> = {
+    support: "Tool / Support",
+    injection: "Prompt Injection",
+    hallucination: "Hallucination",
+    memory: "Memory Recall",
+    contradiction: "Contradiction",
+    system_failure: "API / System Failure",
+  };
+  return map[type || ""] || (type || "General");
+}
+
+function TraceChips({ trace }: { trace: Trace }) {
+  const chips: { key: string; label: string; tone: "ok" | "bad" | "warn" | "muted" }[] = [];
+  (trace.tool_calls || []).forEach((tc, i) =>
+    chips.push({ key: `t${i}`, label: `🔧 ${tc.name} ${tc.ok === false ? "✕ failed" : "✓"}`, tone: tc.ok === false ? "bad" : "ok" })
+  );
+  (trace.retrieved_docs || []).forEach((d, i) =>
+    chips.push({ key: `d${i}`, label: `📄 ${d.title}${d.stale ? " ⚠ stale" : ""}`, tone: d.stale ? "warn" : "muted" })
+  );
+  if (typeof trace.latency_ms === "number") chips.push({ key: "lat", label: `⏱ ${trace.latency_ms}ms`, tone: "muted" });
+  if (typeof trace.tokens === "number") chips.push({ key: "tok", label: `◆ ${trace.tokens} tok`, tone: "muted" });
+  if (trace.error) chips.push({ key: "err", label: `✕ ${trace.error}`, tone: "bad" });
+  if (!chips.length) return null;
+  const toneCls: Record<string, string> = {
+    ok: "border-[#34D399]/30 text-[#34D399]",
+    bad: "border-[#F87171]/35 text-[#F87171]",
+    warn: "border-[#FBBF24]/35 text-[#FBBF24]",
+    muted: "border-white/10 text-slate-400",
+  };
+  return (
+    <div className="mt-2 flex flex-wrap gap-1.5">
+      {chips.map((c) => (
+        <span key={c.key} className={`rounded-md border bg-white/[0.03] px-2 py-0.5 font-mono text-[11px] ${toneCls[c.tone]}`}>
+          {c.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function Transcript({ messages }: { messages: Message[] }) {
+  if (!messages?.length) return <p className="mt-3 text-xs text-slate-500">No transcript recorded.</p>;
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      {messages.map((m, i) => (
+        <div
+          key={i}
+          className={`rounded-lg px-3 py-2 text-sm ${
+            m.role === "tester" ? "border border-[#7C5CFF]/25 bg-[#7C5CFF]/[0.07]" : "border border-white/10 bg-white/[0.03]"
+          }`}
+        >
+          <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-slate-500">
+            {m.role === "tester" ? "🧪 AgentShield asked" : "🤖 Agent replied"}
+          </div>
+          <div className="whitespace-pre-wrap leading-relaxed text-[#F8FAFC]/90">{m.content}</div>
+          {m.trace && <TraceChips trace={m.trace} />}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TranscriptDetails({ messages, label }: { messages: Message[]; label: string }) {
+  return (
+    <details className="group mt-4">
+      <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-slate-400 transition-colors hover:text-slate-200">
+        <ArrowRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+        {label}
+      </summary>
+      <Transcript messages={messages} />
+    </details>
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          /* ignore */
+        }
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+      className="mt-3 flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-[#F8FAFC] transition-all hover:border-white/30 hover:bg-white/10"
+    >
+      {copied ? <Check className="h-3.5 w-3.5 text-[#34D399]" /> : <Copy className="h-3.5 w-3.5" />}
+      {copied ? "Copied" : "Copy fix"}
+    </button>
+  );
+}
+
+export default function DashboardPage() {
+  const [step, setStep] = useState<Step>("connect");
+
+  // Prefilled to our sample RAG agent so the demo is one click.
+  const [agentName, setAgentName] = useState("Store Support Agent (RAG)");
+  const [endpointUrl, setEndpointUrl] = useState("http://localhost:8002/chat");
+  const [apiKey, setApiKey] = useState("");
+  const [provider, setProvider] = useState("openai");
+  // Knowledge source (priority): uploaded docs > free-text about > auto-discovery.
+  const [knowledgeText, setKnowledgeText] = useState("");
+  const [knowledgeFile, setKnowledgeFile] = useState("");
+  const [aboutText, setAboutText] = useState("");
+  const [detected, setDetected] = useState(""); // description AgentShield auto-discovered
+
+  const onUpload = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      setKnowledgeText(text.slice(0, 20000));
+      setKnowledgeFile(file.name);
+    } catch {
+      setError("Couldn't read that file — please use a text/markdown file.");
+    }
+  };
+  const clearUpload = () => { setKnowledgeText(""); setKnowledgeFile(""); };
+
+  const [verifyIndex, setVerifyIndex] = useState(0);
+  const [selectedTests, setSelectedTests] = useState<string[]>(
+    TEST_CATEGORIES.filter((c) => c.type !== "system_failure").map((c) => c.label)
+  );
+  const [guidance, setGuidance] = useState("");
+
+  const [agentId, setAgentId] = useState<number | null>(null);
+  const [runId, setRunId] = useState<number | null>(null);
+  const [counts, setCounts] = useState<RunCounts | null>(null);
+  const [report, setReport] = useState<Report | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [tickLabel, setTickLabel] = useState(0);
+
+  const canVerify = agentName.trim().length > 0 && endpointUrl.trim().length > 0;
+  const canRunTest = selectedTests.length > 0;
+
+  const toggleTest = (label: string) =>
+    setSelectedTests((prev) => (prev.includes(label) ? prev.filter((i) => i !== label) : [...prev, label]));
+
+  const handleReset = () => {
+    setStep("connect");
+    setApiKey("");
+    setKnowledgeText("");
+    setKnowledgeFile("");
+    setAboutText("");
+    setDetected("");
+    setSelectedTests(TEST_CATEGORIES.filter((c) => c.type !== "system_failure").map((c) => c.label));
+    setGuidance("");
+    setVerifyIndex(0);
+    setAgentId(null);
+    setRunId(null);
+    setCounts(null);
+    setReport(null);
+    setError(null);
+  };
+
+  // --- Verify: register + real probe, with a staged animation ---
+  const handleVerifyConnection = async () => {
+    if (!canVerify) return;
+    setError(null);
+    setStep("verifying");
+    setVerifyIndex(0);
+    try {
+      await sleep(400);
+      setVerifyIndex(1);
+      const auth = apiKey.trim() ? `Authorization: Bearer ${apiKey.trim()}` : null;
+      const { agent_id } = await registerAgent({
+        name: agentName.trim(),
+        endpoint_url: endpointUrl.trim(),
+        response_path: "reply",
+        auth_header: auth,
+        description: aboutText.trim() || undefined,
+      });
+      setAgentId(agent_id);
+      setVerifyIndex(2);
+      await sleep(300);
+      setVerifyIndex(3);
+      const probe = await probeAgent(agent_id);
+      if (!probe.ok) throw new Error(probe.error || "Endpoint did not return a valid response.");
+      // No docs and no description → AgentShield auto-discovers what the agent does.
+      if (!knowledgeText.trim() && !aboutText.trim()) {
+        try {
+          const d = await discoverAgent(agent_id);
+          setDetected(d.description);
+        } catch {
+          /* non-fatal — generation will still infer/fallback */
+        }
+      }
+      setVerifyIndex(4);
+      await sleep(500);
+      setStep("configure");
+    } catch (e) {
+      setError(`Connection failed: ${(e as Error).message}`);
+      await sleep(500);
+      setStep("connect");
+    }
+  };
+
+  // --- Run: create run, then poll ---
+  const handleRunTest = async () => {
+    if (!canRunTest || !agentId) return;
+    setError(null);
+    const tests = Array.from(new Set(selectedTests.map((l) => TEST_CATEGORIES.find((c) => c.label === l)?.type).filter(Boolean))) as string[];
+    try {
+      const { run_id } = await createRun(agentId, tests, guidance, knowledgeText);
+      setRunId(run_id);
+      setCounts(null);
+      setReport(null);
+      setStep("running");
+    } catch (e) {
+      setError(`Couldn't start run: ${(e as Error).message}`);
+    }
+  };
+
+  useEffect(() => {
+    if (step !== "running" || !runId) return;
+    let alive = true;
+    const poll = async () => {
+      try {
+        const r = await getRun(runId);
+        if (!alive) return;
+        setCounts(r.counts);
+        if (r.status === "done") {
+          const rep = await getReport(runId);
+          if (!alive) return;
+          setReport(rep);
+          setTimeout(() => alive && setStep("results"), 600);
+          return;
+        }
+        if (r.status === "error") {
+          setError("The run errored — showing partial results.");
+          const rep = await getReport(runId).catch(() => null);
+          if (rep) setReport(rep);
+          setStep("results");
+          return;
+        }
+      } catch {
+        /* transient — keep polling */
+      }
+      if (alive) setTimeout(poll, 1500);
+    };
+    poll();
+    return () => {
+      alive = false;
+    };
+  }, [step, runId]);
+
+  // Rotate the "currently testing" label while running.
+  useEffect(() => {
+    if (step !== "running") return;
+    const id = setInterval(() => setTickLabel((t) => t + 1), 900);
+    return () => clearInterval(id);
+  }, [step]);
+
+  const viewSampleReport = async () => {
+    try {
+      const rep = await getDemoReport();
+      setReport(rep);
+      setStep("results");
+    } catch (e) {
+      setError(`Couldn't load sample report: ${(e as Error).message}`);
+    }
+  };
+
+  // Deep link: /dashboard?sample=1 opens the sample report directly (client-only, SSR-safe).
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("sample")) {
+      setStep("results");
+      getDemoReport().then(setReport).catch((e) => setError(`Couldn't load sample report: ${e.message}`));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const totalScenarios = counts?.scenarios || 8;
+  const progressPercent = counts
+    ? Math.min(100, Math.round(((counts.conversations + counts.judged) / (Math.max(totalScenarios, 1) * 2)) * 100))
+    : 4;
+  const currentTestLabel = selectedTests.length ? selectedTests[tickLabel % selectedTests.length] : "scenarios";
+  const currentStepIndex = WIZARD_STEPS.indexOf(step as (typeof WIZARD_STEPS)[number]);
+
+  // ---- derived results from the real report ----
+  const reliabilityScore = report?.reliability_score ?? 0;
+
+  const secondaryMetrics = useMemo(() => {
+    const p = report?.breakdown?.performance;
+    if (!p) return [] as { label: string; value: string; icon: typeof Clock }[];
+    return [
+      { label: "Average Latency", value: `${(p.avg_latency_ms / 1000).toFixed(2)}s`, icon: Clock },
+      { label: "Est. Cost", value: `$${p.est_cost_usd.toFixed(4)}`, icon: Coins },
+      { label: "Total Tokens", value: p.total_tokens.toLocaleString(), icon: Cpu },
+    ];
+  }, [report]);
+
+  const categoryScores = useMemo(() => {
+    const bt = report?.breakdown?.by_test_type;
+    if (!bt) return [] as { category: string; score: number }[];
+    return Object.entries(bt)
+      .map(([type, v]) => ({ category: prettify(type), score: Math.round((v.pass / ((v.pass + v.fail) || 1)) * 100) }))
+      .sort((a, b) => a.score - b.score);
+  }, [report]);
+
+  const failedScenarios = useMemo(() => {
+    return (report?.conversations || [])
+      .filter((c) => c.verdict === "fail")
+      .map((c) => ({
+        scenario: c.scenario_title || "Untitled scenario",
+        category: prettify(c.test_type),
+        severity: c.severity || "med",
+        rootCause: c.explanation || c.evidence || "See the trace for details.",
+        fix: c.suggested_fix || "",
+        evidence: c.evidence || "",
+        messages: c.messages || [],
+      }));
+  }, [report]);
+
+  const passedScenarios = useMemo(() => {
+    return (report?.conversations || [])
+      .filter((c) => c.verdict !== "fail")
+      .map((c) => ({
+        scenario: c.scenario_title || "Untitled scenario",
+        category: prettify(c.test_type),
+        messages: c.messages || [],
+      }));
+  }, [report]);
+
+  const recommendations = useMemo(() => {
+    const seen = new Set<string>();
+    const out: { title: string; description: string }[] = [];
+    failedScenarios.forEach((f) => {
+      if (f.fix && !seen.has(f.fix)) {
+        seen.add(f.fix);
+        out.push({ title: `Fix · ${f.category}`, description: f.fix });
+      }
+    });
+    return out;
+  }, [failedScenarios]);
+
+  return (
+    <main className="min-h-screen bg-[#0B0B0F] pb-24">
+      {shapes.map((shape, index) => (
+        <motion.div
+          key={index}
+          aria-hidden
+          className="pointer-events-none fixed"
+          style={{
+            width: shape.size,
+            height: shape.size,
+            top: shape.top,
+            left: shape.left,
+            borderRadius: shape.radius,
+            background: `radial-gradient(circle at 30% 28%, ${shape.color}66, ${shape.color}22 40%, rgba(10,10,14,0.35) 75%)`,
+            border: `1px solid ${shape.color}40`,
+            boxShadow: "inset -10px -10px 26px rgba(0,0,0,0.4), inset 6px 6px 14px rgba(255,255,255,0.05), 0 16px 40px rgba(0,0,0,0.3)",
+            filter: "blur(6px)",
+          }}
+          initial={{ rotate: shape.rotate }}
+          animate={{ y: [0, -16, 0], x: [0, 10, 0], rotate: [shape.rotate, shape.rotate + 14, shape.rotate] }}
+          transition={{ duration: shape.duration, repeat: Infinity, ease: "easeInOut", delay: shape.delay }}
+        />
+      ))}
+
+      <header className="sticky top-0 z-50 border-b border-white/12 bg-[#0B0B0F]/70 backdrop-blur-md">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
+          <Link href="/" className="flex items-center gap-2">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-white/20 bg-white/4 text-slate-200">
+              <ShieldCheck className="h-5 w-5" strokeWidth={1.5} />
+            </div>
+            <span className="font-logo text-lg font-extrabold tracking-tight text-[#F8FAFC]">AgentShield</span>
+          </Link>
+
+          {step === "results" ? (
+            <motion.button
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
+              transition={{ duration: 0.3 }}
+              onClick={handleReset}
+              className="flex items-center gap-2 rounded-full border border-white/20 bg-white/4 px-5 py-2.5 text-sm font-medium text-[#F8FAFC] backdrop-blur-md transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_24px_rgba(255,255,255,0.2)]"
+            >
+              <RotateCcw className="h-4 w-4" strokeWidth={1.5} />
+              Run New Test
+            </motion.button>
+          ) : (
+            <nav className="hidden items-center gap-3 sm:flex">
+              {WIZARD_STEPS.map((s, i) => (
+                <div key={s} className="flex items-center gap-3">
+                  <div
+                    className={`flex items-center gap-2 text-xs font-medium ${
+                      i === currentStepIndex ? "text-[#F8FAFC]" : i < currentStepIndex ? "text-slate-400" : "text-slate-600"
+                    }`}
+                  >
+                    <span
+                      className={`flex h-5 w-5 items-center justify-center rounded-full border text-[10px] ${
+                        i === currentStepIndex ? "border-white/50 bg-white/10" : i < currentStepIndex ? "border-white/30 bg-white/5" : "border-white/10"
+                      }`}
+                    >
+                      {i < currentStepIndex ? <CheckCircle2 className="h-3 w-3" /> : i + 1}
+                    </span>
+                    {STEP_LABELS[s]}
+                  </div>
+                  {i < WIZARD_STEPS.length - 1 && <span className="h-px w-6 bg-white/10" />}
+                </div>
+              ))}
+            </nav>
+          )}
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-7xl px-6">
+        {error && (
+          <div className="mt-6 rounded-lg border border-[#F87171]/40 bg-[#F87171]/10 px-4 py-3 text-sm text-[#F87171]">
+            {error}
+          </div>
+        )}
+
+        <AnimatePresence>
+          {step === "connect" && (
+            <motion.section key="connect" {...fadeStep} className="mt-10 flex justify-center">
+              <div className="w-full max-w-2xl rounded-xl border border-white/12 bg-white/2 p-10 backdrop-blur-md">
+                <h2 className="font-heading text-2xl font-medium text-[#F8FAFC]">Connect Your AI Agent</h2>
+                <p className="mt-2 text-sm text-[#9CA3AF]">
+                  Point AgentShield at any agent&apos;s HTTP endpoint. (Prefilled with our sample RAG agent.)
+                </p>
+
+                <div className="mt-8 flex flex-col gap-5">
+                  <div>
+                    <label className="text-xs font-medium text-[#9CA3AF]">Agent Name</label>
+                    <div className="mt-2 flex items-center gap-3 rounded-lg border border-white/12 bg-white/2 px-4 py-3 transition-colors duration-300 focus-within:border-white/30">
+                      <Bot className="h-4 w-4 shrink-0 text-slate-400" strokeWidth={1.5} />
+                      <input value={agentName} onChange={(e) => setAgentName(e.target.value)} placeholder="e.g. Travel Booking Agent" className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-medium text-[#9CA3AF]">Endpoint URL</label>
+                    <div className="mt-2 flex items-center gap-3 rounded-lg border border-white/12 bg-white/2 px-4 py-3 transition-colors duration-300 focus-within:border-white/30">
+                      <Link2 className="h-4 w-4 shrink-0 text-slate-400" strokeWidth={1.5} />
+                      <input value={endpointUrl} onChange={(e) => setEndpointUrl(e.target.value)} placeholder="https://api.example.com/v1/agent" className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-medium text-[#9CA3AF]">API Key <span className="text-slate-600">(optional)</span></label>
+                    <div className="mt-2 flex items-center gap-3 rounded-lg border border-white/12 bg-white/2 px-4 py-3 transition-colors duration-300 focus-within:border-white/30">
+                      <KeyRound className="h-4 w-4 shrink-0 text-slate-400" strokeWidth={1.5} />
+                      <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} type="password" placeholder="sent as Authorization: Bearer …" className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600" />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-medium text-[#9CA3AF]">
+                      Agent knowledge <span className="text-slate-600">(optional — all three tiers below are optional)</span>
+                    </label>
+
+                    {/* Tier 1: upload docs */}
+                    {!knowledgeFile ? (
+                      <label className="mt-2 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-white/20 bg-white/2 px-4 py-4 text-sm text-slate-400 transition-colors hover:border-white/40 hover:text-[#F8FAFC]">
+                        <Upload className="h-5 w-5 shrink-0" strokeWidth={1.5} />
+                        <span>Upload the agent&apos;s docs / knowledge base <span className="text-slate-600">(.md, .txt, .json — best results)</span></span>
+                        <input
+                          type="file"
+                          accept=".md,.txt,.json,.csv,.text"
+                          className="hidden"
+                          onChange={(e) => onUpload(e.target.files?.[0])}
+                        />
+                      </label>
+                    ) : (
+                      <div className="mt-2 flex items-center gap-3 rounded-lg border border-[#34D399]/30 bg-[#34D399]/[0.06] px-4 py-3 text-sm">
+                        <FileText className="h-5 w-5 shrink-0 text-[#34D399]" strokeWidth={1.5} />
+                        <span className="flex-1 truncate text-[#F8FAFC]">{knowledgeFile}</span>
+                        <span className="text-xs text-slate-500">{knowledgeText.length.toLocaleString()} chars</span>
+                        <button onClick={clearUpload} className="text-slate-400 hover:text-[#F87171]"><X className="h-4 w-4" /></button>
+                      </div>
+                    )}
+
+                    {/* Tier 2: free-text about (only if no doc) */}
+                    {!knowledgeFile && (
+                      <textarea
+                        value={aboutText}
+                        onChange={(e) => setAboutText(e.target.value)}
+                        rows={2}
+                        placeholder="…or just describe the agent (optional), e.g. 'A retail banking assistant: transfers, overdraft fees, fraud, loans.'"
+                        className="mt-3 w-full rounded-lg border border-white/12 bg-white/2 px-4 py-3 text-sm text-[#F8FAFC] outline-none transition-colors focus:border-white/30 placeholder:text-slate-600"
+                      />
+                    )}
+
+                    {/* Tier 3: auto-discovery note */}
+                    {!knowledgeFile && !aboutText.trim() && (
+                      <p className="mt-2 flex items-center gap-2 text-xs text-slate-500">
+                        <ScanSearch className="h-3.5 w-3.5" strokeWidth={1.5} />
+                        Leave both empty — AgentShield will probe the agent and figure out its domain itself.
+                      </p>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-medium text-[#9CA3AF]">Provider</label>
+                    <div className="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                      {PROVIDERS.map((p) => {
+                        const active = provider === p.id;
+                        return (
+                          <button
+                            key={p.id}
+                            onClick={() => setProvider(p.id)}
+                            className={`flex flex-col items-center gap-2 rounded-lg border px-3 py-4 text-xs font-medium transition-all duration-300 ${
+                              active ? "border-white/50 bg-white/10 text-[#F8FAFC] shadow-[0_0_20px_rgba(255,255,255,0.15)]" : "border-white/10 bg-white/2 text-slate-400 hover:border-white/20 hover:text-[#F8FAFC]"
+                            }`}
+                          >
+                            <p.icon className="h-5 w-5" strokeWidth={1.5} />
+                            {p.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+
+                <motion.button
+                  whileHover={{ scale: canVerify ? 1.02 : 1 }}
+                  whileTap={{ scale: canVerify ? 0.98 : 1 }}
+                  transition={{ duration: 0.3 }}
+                  onClick={handleVerifyConnection}
+                  disabled={!canVerify}
+                  className="mt-8 flex w-full items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-8 py-3.5 text-base font-medium text-[#F8FAFC] backdrop-blur-md transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:shadow-none"
+                >
+                  Verify Connection
+                  <ArrowRight className="h-4 w-4" />
+                </motion.button>
+
+                <button onClick={viewSampleReport} className="mt-4 w-full text-center text-xs font-medium text-slate-500 transition-colors hover:text-slate-300">
+                  or view a sample report
+                </button>
+              </div>
+            </motion.section>
+          )}
+
+          {step === "verifying" && (
+            <motion.section key="verifying" {...fadeStep} className="mt-10 flex justify-center">
+              <div className="w-full max-w-lg rounded-xl border border-white/12 bg-white/2 p-10 text-center backdrop-blur-md">
+                <h2 className="font-heading text-2xl font-medium text-[#F8FAFC]">Verifying Connection</h2>
+                <p className="mt-2 text-sm text-[#9CA3AF]">Reaching {agentName || "your agent"} over HTTP…</p>
+                <div className="mt-8 flex flex-col gap-4 text-left">
+                  {VERIFICATION_STEPS.map((label, i) => {
+                    const state = i < verifyIndex ? "done" : i === verifyIndex ? "active" : "pending";
+                    return (
+                      <motion.div key={label} initial={{ opacity: 0, x: -8 }} animate={{ opacity: state === "pending" ? 0.35 : 1, x: 0 }} transition={{ duration: 0.3 }} className="flex items-center gap-3">
+                        {state === "done" ? <CheckCircle2 className="h-5 w-5 shrink-0 text-[#34D399]" /> : state === "active" ? <Loader2 className="h-5 w-5 shrink-0 animate-spin text-slate-300" /> : <Circle className="h-5 w-5 shrink-0 text-slate-700" />}
+                        <span className={`text-sm ${state === "pending" ? "text-slate-600" : "text-[#F8FAFC]"}`}>{label}</span>
+                      </motion.div>
+                    );
+                  })}
+                </div>
+              </div>
+            </motion.section>
+          )}
+
+          {step === "configure" && (
+            <motion.section key="configure" {...fadeStep} className="mt-10">
+              <div className="flex flex-col gap-6">
+                <div className="flex items-center gap-4 rounded-xl border border-white/12 bg-white/2 p-6 backdrop-blur-md">
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg border border-white/20 bg-white/4 text-slate-200">
+                    <Bot className="h-6 w-6" strokeWidth={1.5} />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-[#9CA3AF]">Connected Agent</p>
+                    <p className="font-heading text-lg font-medium text-[#F8FAFC]">{agentName || "Untitled Agent"}</p>
+                    <p className="truncate text-xs text-slate-500">{PROVIDERS.find((p) => p.id === provider)?.label} · {endpointUrl}</p>
+                    <p className="mt-1 text-xs text-[#67e8f9]">
+                      {knowledgeFile
+                        ? `📄 Tests grounded in uploaded docs: ${knowledgeFile}`
+                        : aboutText.trim()
+                        ? `📝 Profile: ${aboutText.trim()}`
+                        : detected
+                        ? `🔎 Auto-detected: ${detected}`
+                        : "Profile inferred at run time"}
+                    </p>
+                  </div>
+                  <CheckCircle2 className="ml-auto h-5 w-5 shrink-0 text-[#34D399]" />
+                </div>
+
+                <div className="rounded-xl border border-white/12 bg-white/2 p-8 backdrop-blur-md">
+                  <h3 className="font-heading text-xl font-medium text-[#F8FAFC]">Configure Test</h3>
+                  <p className="mt-1 text-sm text-[#9CA3AF]">Choose which reliability tests to run against this agent.</p>
+
+                  <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {TEST_CATEGORIES.map((cat) => {
+                      const active = selectedTests.includes(cat.label);
+                      return (
+                        <button
+                          key={cat.label}
+                          onClick={() => toggleTest(cat.label)}
+                          className={`flex items-center gap-3 rounded-lg border px-4 py-4 text-left text-sm font-medium transition-all duration-300 ${
+                            active ? "border-white/50 bg-white/10 text-[#F8FAFC] shadow-[0_0_20px_rgba(255,255,255,0.15)]" : "border-white/10 bg-white/2 text-slate-400 hover:border-white/20 hover:text-[#F8FAFC]"
+                          }`}
+                        >
+                          <cat.icon className="h-5 w-5 shrink-0" strokeWidth={1.5} />
+                          {cat.label}
+                          {active && <CheckCircle2 className="ml-auto h-4 w-4 shrink-0 text-[#34D399]" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="mt-6">
+                    <label className="text-xs font-medium text-[#9CA3AF]">Custom guidance &amp; edge cases <span className="text-slate-600">(optional)</span></label>
+                    <textarea
+                      value={guidance}
+                      onChange={(e) => setGuidance(e.target.value)}
+                      rows={3}
+                      placeholder="Describe your domain and edge cases to stress-test, e.g. 'Insurance claims bot — never quote a payout without a claim number; handle policy-cancellation edge cases.' AgentShield refines this and targets it."
+                      className="mt-2 w-full rounded-lg border border-white/12 bg-white/2 px-4 py-3 text-sm text-[#F8FAFC] outline-none transition-colors focus:border-white/30 placeholder:text-slate-600"
+                    />
+                  </div>
+
+                  <motion.button
+                    whileHover={{ scale: canRunTest ? 1.02 : 1 }}
+                    whileTap={{ scale: canRunTest ? 0.98 : 1 }}
+                    transition={{ duration: 0.3 }}
+                    onClick={handleRunTest}
+                    disabled={!canRunTest}
+                    className="mt-8 flex w-full items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-8 py-4 text-base font-medium text-[#F8FAFC] backdrop-blur-md transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:shadow-none"
+                  >
+                    <PlayCircle className="h-5 w-5" strokeWidth={1.5} />
+                    Run Reliability Test
+                  </motion.button>
+                </div>
+              </div>
+            </motion.section>
+          )}
+
+          {step === "running" && (
+            <motion.section key="running" {...fadeStep} className="mt-10 flex justify-center">
+              <div className="w-full max-w-2xl rounded-xl border border-white/12 bg-white/2 p-10 text-center backdrop-blur-md">
+                <h2 className="font-heading text-2xl font-medium text-[#F8FAFC]">Running Tests…</h2>
+                <p className="mt-2 text-sm text-[#9CA3AF]">
+                  {counts ? `${counts.judged} / ${totalScenarios} scenarios judged · ${counts.conversations} conversations` : "Generating adversarial scenarios…"}
+                </p>
+
+                <div className="mt-6 h-3 w-full overflow-hidden rounded-full bg-white/6">
+                  <motion.div className="h-full rounded-full bg-linear-to-r from-[#E5E7EB] to-[#94A3B8]" animate={{ width: `${progressPercent}%` }} transition={{ duration: 0.4, ease: "linear" }} />
+                </div>
+
+                <div className="mt-8 flex items-center gap-3 rounded-lg border border-white/8 bg-white/1 px-6 py-4 text-left">
+                  <Loader2 className="h-5 w-5 shrink-0 animate-spin text-slate-300" />
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-[#9CA3AF]">Currently exercising</p>
+                    <p className="truncate text-sm font-medium text-[#F8FAFC]">{currentTestLabel}</p>
+                  </div>
+                  <span className="ml-auto shrink-0 rounded-full bg-white/10 px-3 py-1 text-xs font-medium text-slate-300">Running…</span>
+                </div>
+              </div>
+            </motion.section>
+          )}
+
+          {step === "results" && !report && (
+            <motion.section key="results-loading" {...fadeStep} className="mt-10 flex justify-center">
+              <div className="flex w-full max-w-lg flex-col items-center gap-4 rounded-xl border border-white/12 bg-white/2 p-12 text-center backdrop-blur-md">
+                <Loader2 className="h-8 w-8 animate-spin text-slate-300" />
+                <p className="font-heading text-lg text-[#F8FAFC]">Loading report…</p>
+              </div>
+            </motion.section>
+          )}
+
+          {step === "results" && report && (
+            <motion.div key="results" {...fadeStep}>
+              {report.is_demo && (
+                <div className="mt-6 rounded-lg border border-[#FBBF24]/30 bg-[#FBBF24]/10 px-4 py-2 text-center text-sm text-[#FBBF24]">
+                  ✦ Sample report — pre-baked demo data (works offline)
+                </div>
+              )}
+
+              <section className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
+                <div className="flex flex-col items-center justify-center rounded-xl border border-white/12 bg-white/2 p-8 text-center backdrop-blur-md">
+                  <div className="relative flex h-40 w-40 items-center justify-center">
+                    <svg width="160" height="160" viewBox="0 0 160 160" className="-rotate-90">
+                      <circle cx="80" cy="80" r={RING_RADIUS} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="10" />
+                      <motion.circle
+                        cx="80" cy="80" r={RING_RADIUS} fill="none" stroke="url(#scoreGradient)" strokeWidth="10" strokeLinecap="round"
+                        strokeDasharray={RING_CIRCUMFERENCE}
+                        initial={{ strokeDashoffset: RING_CIRCUMFERENCE }}
+                        animate={{ strokeDashoffset: RING_CIRCUMFERENCE - (RING_CIRCUMFERENCE * reliabilityScore) / 100 }}
+                        transition={{ duration: 1.2, ease: "easeOut" }}
+                      />
+                      <defs>
+                        <linearGradient id="scoreGradient" x1="0" y1="0" x2="1" y2="1">
+                          <stop offset="0%" stopColor={reliabilityScore >= 75 ? "#34D399" : reliabilityScore >= 50 ? "#FBBF24" : "#F87171"} />
+                          <stop offset="100%" stopColor={reliabilityScore >= 75 ? "#10B981" : reliabilityScore >= 50 ? "#F59E0B" : "#EF4444"} />
+                        </linearGradient>
+                      </defs>
+                    </svg>
+                    <div className="absolute flex flex-col items-center">
+                      <span className="font-heading text-4xl font-medium text-[#F8FAFC]">{Math.round(reliabilityScore)}</span>
+                    </div>
+                  </div>
+                  <p className="mt-4 text-sm font-medium text-[#9CA3AF]">Reliability Score</p>
+                  {report.breakdown && (
+                    <p className="mt-1 text-xs text-slate-500">{report.breakdown.passed} passed · {report.breakdown.failed} failed</p>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 gap-6 sm:grid-cols-3 lg:col-span-2">
+                  {secondaryMetrics.map((metric, index) => (
+                    <motion.div key={metric.label} initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: "easeOut", delay: index * 0.1 }} whileHover={{ y: -4 }} className="flex flex-col justify-center rounded-xl border border-white/12 bg-white/2 p-6 backdrop-blur-md transition-all duration-300 hover:border-white/20">
+                      <div className="flex h-11 w-11 items-center justify-center rounded-lg border border-white/20 bg-white/4 text-slate-200">
+                        <metric.icon className="h-5 w-5" strokeWidth={1.5} />
+                      </div>
+                      <p className="mt-4 text-sm font-medium text-[#9CA3AF]">{metric.label}</p>
+                      <p className="font-heading mt-1 text-3xl font-medium text-[#F8FAFC]">{metric.value}</p>
+                    </motion.div>
+                  ))}
+
+                  {categoryScores.length > 0 && (
+                    <div className="rounded-xl border border-white/12 bg-white/2 p-6 backdrop-blur-md sm:col-span-3">
+                      <h3 className="font-heading text-base font-medium text-[#F8FAFC]">Resilience by Category</h3>
+                      <p className="mt-1 text-sm text-[#9CA3AF]">Pass rate per test type.</p>
+                      <div className="mt-6 flex flex-col gap-5">
+                        {categoryScores.map((item, index) => (
+                          <div key={item.category}>
+                            <div className="flex items-center justify-between text-sm">
+                              <span className="font-medium text-[#F8FAFC]">{item.category}</span>
+                              <span className="text-[#9CA3AF]">{item.score}%</span>
+                            </div>
+                            <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-white/4">
+                              <motion.div
+                                className="h-full rounded-full"
+                                style={{ background: item.score >= 75 ? "linear-gradient(90deg,#34D399,#10B981)" : item.score >= 50 ? "linear-gradient(90deg,#FBBF24,#F59E0B)" : "linear-gradient(90deg,#F87171,#EF4444)" }}
+                                initial={{ width: 0 }}
+                                animate={{ width: `${item.score}%` }}
+                                transition={{ duration: 0.8, ease: "easeOut", delay: index * 0.08 }}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </section>
+
+              {failedScenarios.length > 0 && (
+                <section className="mt-8 rounded-xl border border-white/12 bg-white/2 p-6 backdrop-blur-md">
+                  <h3 className="font-heading text-base font-medium text-[#F8FAFC]">Failed Scenarios ({failedScenarios.length})</h3>
+                  <div className="mt-5 flex flex-col gap-4">
+                    {failedScenarios.map((row, i) => (
+                      <div key={i} className="rounded-lg border border-[#F87171]/20 bg-[#F87171]/[0.04] p-5">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <span className="font-medium text-[#F8FAFC]">{row.scenario}</span>
+                          <span className={`rounded-full px-3 py-1 text-xs font-medium ${row.severity === "high" ? "bg-[#F87171]/15 text-[#F87171]" : row.severity === "med" ? "bg-[#FBBF24]/15 text-[#FBBF24]" : "bg-white/10 text-slate-300"}`}>
+                            {row.severity === "med" ? "medium" : row.severity} severity
+                          </span>
+                        </div>
+                        <div className="mt-2 flex items-center gap-1.5 text-xs text-[#9CA3AF]"><Tag className="h-3 w-3" strokeWidth={1.5} />{row.category}</div>
+                        <p className="mt-2 text-sm text-[#9CA3AF]">{row.rootCause}</p>
+                        {row.fix && (
+                          <div className="mt-3 rounded-lg border border-white/10 bg-[#0B0B0F]/60 p-3">
+                            <p className="text-xs font-medium text-slate-500">Pasteable fix</p>
+                            <p className="mt-1 font-mono text-xs leading-relaxed text-[#67e8f9]">{row.fix}</p>
+                            <CopyButton text={row.fix} />
+                          </div>
+                        )}
+                        {row.evidence && (
+                          <p className="mt-3 border-l-2 border-[#F87171]/40 pl-3 text-xs italic text-slate-400">
+                            Evidence: {row.evidence}
+                          </p>
+                        )}
+                        <TranscriptDetails
+                          messages={row.messages}
+                          label={`View what AgentShield asked & how it broke (${row.messages.length} turns)`}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {recommendations.length > 0 && (
+                <section className="mt-8">
+                  <div className="flex items-center gap-3">
+                    <SlidersHorizontal className="h-5 w-5 text-slate-300" strokeWidth={1.5} />
+                    <h3 className="font-heading text-base font-medium text-[#F8FAFC]">Recommendations</h3>
+                  </div>
+                  <div className="mt-4 grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
+                    {recommendations.map((rec, index) => (
+                      <motion.div key={index} initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, ease: "easeOut", delay: index * 0.1 }} whileHover={{ y: -4 }} className="flex flex-col rounded-xl border border-white/12 bg-white/2 p-6 backdrop-blur-md transition-all duration-300 hover:border-white/20">
+                        <div className="flex h-11 w-11 items-center justify-center rounded-lg border border-white/20 bg-white/4 text-slate-200">
+                          <RefreshCcw className="h-5 w-5" strokeWidth={1.5} />
+                        </div>
+                        <h4 className="font-heading mt-4 text-sm font-medium text-[#F8FAFC]">{rec.title}</h4>
+                        <p className="mt-2 text-sm leading-relaxed text-[#9CA3AF]">{rec.description}</p>
+                        <CopyButton text={rec.description} />
+                      </motion.div>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {failedScenarios.length === 0 && (
+                <section className="mt-8 rounded-xl border border-[#34D399]/25 bg-[#34D399]/[0.06] p-8 text-center backdrop-blur-md">
+                  <CheckCircle2 className="mx-auto h-8 w-8 text-[#34D399]" />
+                  <p className="mt-3 font-heading text-lg text-[#F8FAFC]">No failures detected</p>
+                  <p className="mt-1 text-sm text-[#9CA3AF]">Every scenario passed. This agent held up across the selected tests.</p>
+                </section>
+              )}
+
+              {passedScenarios.length > 0 && (
+                <section className="mt-8 rounded-xl border border-white/12 bg-white/2 p-6 backdrop-blur-md">
+                  <h3 className="font-heading text-base font-medium text-[#F8FAFC]">
+                    Passing Scenarios ({passedScenarios.length})
+                  </h3>
+                  <p className="mt-1 text-sm text-[#9CA3AF]">
+                    What AgentShield asked and how the agent handled it — expand any to see the full transcript &amp; trace.
+                  </p>
+                  <div className="mt-5 flex flex-col gap-3">
+                    {passedScenarios.map((row, i) => (
+                      <div key={i} className="rounded-lg border border-[#34D399]/15 bg-[#34D399]/[0.04] p-4">
+                        <div className="flex flex-wrap items-center gap-3">
+                          <CheckCircle2 className="h-4 w-4 shrink-0 text-[#34D399]" />
+                          <span className="font-medium text-[#F8FAFC]">{row.scenario}</span>
+                          <span className="flex items-center gap-1.5 text-xs text-[#9CA3AF]">
+                            <Tag className="h-3 w-3" strokeWidth={1.5} />
+                            {row.category}
+                          </span>
+                        </div>
+                        <TranscriptDetails messages={row.messages} label={`View transcript & trace (${row.messages.length} turns)`} />
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </main>
+  );
+}
