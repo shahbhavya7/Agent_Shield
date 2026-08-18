@@ -44,6 +44,16 @@ export interface RunStatus {
   counts: RunCounts;
 }
 
+// One test case in the reviewable suite — mirrors a backend `scenarios` row.
+export interface TestCase {
+  title: string;
+  user_goal: string;
+  test_type: string;
+  assigned_fault: string;
+  expected_behavior: string;
+  seed_turns: string[];
+}
+
 export interface Trace {
   tool_calls?: { name: string; result?: string; ok?: boolean }[];
   retrieved_docs?: { id: string; title: string; stale?: boolean }[];
@@ -120,15 +130,31 @@ export function discoverAgent(agentId: number): Promise<{ description: string }>
   return req(`/agents/${agentId}/discover`, { method: "POST" });
 }
 
-export function createRun(
+// Stage 1 — generate the test suite for review. Runs nothing.
+export function generateScenarios(
   agentId: number,
   tests: string[],
   guidance = "",
   knowledge = ""
+): Promise<{ scenarios: TestCase[] }> {
+  return req("/runs/scenarios", {
+    method: "POST",
+    body: JSON.stringify({ agent_id: agentId, tests, guidance, knowledge }),
+  });
+}
+
+// Stage 3 — execute. `scenarios` is the finalized suite the user reviewed; when it is
+// passed the backend runs exactly these and never regenerates.
+export function createRun(
+  agentId: number,
+  tests: string[],
+  guidance = "",
+  knowledge = "",
+  scenarios: TestCase[] = []
 ): Promise<{ run_id: number }> {
   return req("/runs", {
     method: "POST",
-    body: JSON.stringify({ agent_id: agentId, tests, guidance, knowledge }),
+    body: JSON.stringify({ agent_id: agentId, tests, guidance, knowledge, scenarios }),
   });
 }
 

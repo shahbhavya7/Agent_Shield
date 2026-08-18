@@ -5,7 +5,8 @@ import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.core.orchestrator import start_run
+from app.core.orchestrator import prepare_scenarios, start_run
+from app.core.scenarios import normalize_scenarios
 from app.db import (
     build_conversation_payload,
     get_agent,
@@ -18,11 +19,27 @@ from app.db import (
 router = APIRouter(prefix="/runs", tags=["runs"])
 
 
-class CreateRun(BaseModel):
+class GenerateScenarios(BaseModel):
     agent_id: int
     tests: list[str] = []
     guidance: str = ""   # optional user domain focus / edge cases
     knowledge: str = ""  # optional uploaded agent docs (authoritative ground truth)
+
+
+class CreateRun(GenerateScenarios):
+    # The user-reviewed, finalized test suite. When present it is executed verbatim and
+    # NO scenarios are generated. Empty => generate (original single-shot behaviour).
+    scenarios: list[dict] = []
+
+
+@router.post("/scenarios")
+async def generate_run_scenarios(body: GenerateScenarios) -> dict:
+    """Stage 1 — generate the test suite for review. Executes nothing, persists nothing."""
+    agent = get_agent(body.agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"agent {body.agent_id} not found")
+    scenarios = await prepare_scenarios(dict(agent), body.tests, body.guidance, body.knowledge)
+    return {"scenarios": scenarios}
 
 
 @router.post("")
@@ -30,9 +47,15 @@ async def create_run(body: CreateRun) -> dict:
     """Insert a run row, launch the orchestrator in the background, return the id now."""
     if get_agent(body.agent_id) is None:
         raise HTTPException(status_code=404, detail=f"agent {body.agent_id} not found")
+    # Sanitize the reviewed suite (it may contain user edits/additions).
+    reviewed = normalize_scenarios(body.scenarios)
+    if body.scenarios and not reviewed:
+        raise HTTPException(status_code=400, detail="the submitted test suite is empty or invalid")
     run_id = insert_run(body.agent_id)
     # Fire-and-forget; the run progresses while the client polls GET /runs/{id}.
-    asyncio.create_task(start_run(run_id, body.agent_id, body.tests, body.guidance, body.knowledge))
+    asyncio.create_task(
+        start_run(run_id, body.agent_id, body.tests, body.guidance, body.knowledge, reviewed)
+    )
     return {"run_id": run_id}
 
 

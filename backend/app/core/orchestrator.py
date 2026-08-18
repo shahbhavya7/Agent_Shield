@@ -21,10 +21,51 @@ from app.db import (
 CONCURRENCY = 3
 
 
+async def prepare_scenarios(
+    agent: dict, selected_types: list[str], guidance: str = "", knowledge: str = ""
+) -> list[dict]:
+    """Stage 1 (generate only): resolve the agent's domain, then build the scenario bank.
+
+    Pure generation — nothing is persisted and nothing is executed. Used both by the
+    review endpoint (POST /runs/scenarios) and by start_run when no reviewed suite is given.
+    """
+    # Resolve the agent's domain profile. Priority: uploaded docs > description >
+    # auto-discovery (probe the agent and infer what it does).
+    description = agent.get("description") or ""
+    if not (knowledge and knowledge.strip()):
+        from app.core.discover import discover_agent, looks_generic
+
+        if looks_generic(description):
+            print(f"[orchestrator] no docs/description — auto-discovering agent {agent.get('id')}")
+            description = await discover_agent(agent)
+
+    # Generate scenarios (falls back to hardcoded bank on LLM failure).
+    scenarios = await generate_scenarios(
+        description or "A customer-support agent.",
+        selected_types,
+        guidance,
+        knowledge,
+    )
+    # Demo safety: cap the number of scenarios so a live run stays fast.
+    from app.config import MAX_SCENARIOS
+
+    return scenarios[:MAX_SCENARIOS]
+
+
 async def start_run(
-    run_id: int, agent_id: int, selected_types: list[str], guidance: str = "", knowledge: str = ""
+    run_id: int,
+    agent_id: int,
+    selected_types: list[str],
+    guidance: str = "",
+    knowledge: str = "",
+    scenarios: list[dict] | None = None,
 ) -> None:
-    """Drive one run to completion in the background. Never raises to the caller."""
+    """Drive one run to completion in the background. Never raises to the caller.
+
+    `scenarios` is the user-reviewed, finalized test suite. When given, it is executed
+    as-is and NO generation happens. When omitted, scenarios are generated first
+    (the original single-shot behaviour).
+    """
     try:
         agent = get_agent(agent_id)
         if agent is None:
@@ -32,27 +73,11 @@ async def start_run(
             return
         agent = dict(agent)
 
-        # 0) Resolve the agent's domain profile. Priority: uploaded docs > description >
-        #    auto-discovery (probe the agent and infer what it does).
-        description = agent.get("description") or ""
-        if not (knowledge and knowledge.strip()):
-            from app.core.discover import discover_agent, looks_generic
-
-            if looks_generic(description):
-                print(f"[orchestrator] no docs/description — auto-discovering agent {agent_id}")
-                description = await discover_agent(agent)
-
-        # 1) Generate scenarios (falls back to hardcoded bank on LLM failure).
-        scenarios = await generate_scenarios(
-            description or "A customer-support agent.",
-            selected_types,
-            guidance,
-            knowledge,
-        )
-        # Demo safety: cap the number of scenarios so a live run stays fast.
-        from app.config import MAX_SCENARIOS
-
-        scenarios = scenarios[:MAX_SCENARIOS]
+        # 1) Use the reviewed suite if the client supplied one; otherwise generate.
+        if not scenarios:
+            scenarios = await prepare_scenarios(agent, selected_types, guidance, knowledge)
+        else:
+            scenarios = [dict(s) for s in scenarios]
 
         # 2) Persist scenario rows; keep the db id on each dict for the runner.
         for s in scenarios:
