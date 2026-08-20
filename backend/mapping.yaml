@@ -1,0 +1,16 @@
+# Internal agent identifier -> the agent's actual / display name.
+#
+# Keys are the identifiers the repo already uses internally:
+#   - `Domain.key` for the agents defined in backend/sample_agents/
+#   - the module/folder name (also its /health "service" value) for sample_rag_bot,
+#     which is standalone and has no Domain object.
+# Values are the existing names from those same definitions — nothing invented here.
+agents:
+  # backend/sample_agents/banking.py   -> Domain(key=..., name=...)
+  banking_bot: "NorthBank Support"
+  # backend/sample_agents/hr.py
+  hr_bot: "PeopleDesk HR Assistant"
+  # backend/sample_agents/insurance.py
+  insurance_bot: "SafeGuard Claims"
+  # backend/sample_rag_bot/main.py -> FastAPI(title=...); also the seeded `agents` row name.
+  sample_rag_bot: "Store Customer-Support Agent (RAG)"

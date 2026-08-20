@@ -1,0 +1,23 @@
+# Which agents are onboarded for each customer.
+#
+# Sample development/testing data — no real customers yet.
+# Agent entries are the internal identifiers defined in backend/mapping.yaml
+# (mapping.yaml owns identifier -> display name; this file owns customer -> agents).
+# The trailing comment on each line is that identifier's name from mapping.yaml.
+#
+# Note: agents are intentionally shared across customers (e.g. banking_bot by Customers 1&2).
+customers:
+  - name: Customer 1
+    agents:
+      - banking_bot   # NorthBank Support
+      - hr_bot        # PeopleDesk HR Assistant
+
+  - name: Customer 2
+    agents:
+      - banking_bot     # NorthBank Support
+      - insurance_bot   # SafeGuard Claims
+
+  - name: Customer 3
+    agents:
+      - hr_bot          # PeopleDesk HR Assistant
+      - insurance_bot   # SafeGuard Claims

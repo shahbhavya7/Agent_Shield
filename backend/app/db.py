@@ -1,16 +1,23 @@
-"""SQLite helpers + schema. Deliberately tiny — no ORM, no migrations (hackathon MVP)."""
-import sqlite3
+"""PostgreSQL helpers + schema. Deliberately tiny — no ORM, no migrations (hackathon MVP).
+
+`init_schema()` is the single, idempotent schema-creation entry point; it runs on FastAPI
+startup. Rows come back as plain dicts (psycopg `dict_row`), so callers use row["col"].
+"""
 from datetime import datetime, timezone
 
-from app.config import DB_PATH
+import psycopg
+from psycopg.rows import dict_row
+
+from app.config import DATABASE_URL
 
 
-def get_conn() -> sqlite3.Connection:
-    """Return a connection with row access by column name and FK enforcement on."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+# Customer name used for agents connected ad-hoc, with no customer selected.
+UNASSIGNED_CUSTOMER = "Unassigned"
+
+
+def get_conn() -> psycopg.Connection:
+    """Return a connection whose rows are dicts (access by column name)."""
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def now_iso() -> str:
@@ -18,14 +25,14 @@ def now_iso() -> str:
 
 
 def init_schema() -> None:
-    """Create the 5 tables if they don't exist. Idempotent."""
+    """Create the tables if they don't exist. Idempotent."""
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.executescript(
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS agents (
-            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            id                SERIAL PRIMARY KEY,
             name              TEXT NOT NULL,
             kind              TEXT NOT NULL,          -- sample | custom
             endpoint_url      TEXT,
@@ -37,17 +44,17 @@ def init_schema() -> None:
         );
 
         CREATE TABLE IF NOT EXISTS runs (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            id               SERIAL PRIMARY KEY,
             agent_id         INTEGER NOT NULL REFERENCES agents(id),
             status           TEXT NOT NULL,           -- queued | running | done | error
-            reliability_score REAL,
+            reliability_score DOUBLE PRECISION,
             breakdown_json   TEXT,
             started_at       TEXT,
             finished_at      TEXT
         );
 
         CREATE TABLE IF NOT EXISTS scenarios (
-            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            id                SERIAL PRIMARY KEY,
             run_id            INTEGER NOT NULL REFERENCES runs(id),
             title             TEXT,
             user_goal         TEXT,
@@ -58,7 +65,7 @@ def init_schema() -> None:
         );
 
         CREATE TABLE IF NOT EXISTS conversations (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            id             SERIAL PRIMARY KEY,
             run_id         INTEGER NOT NULL REFERENCES runs(id),
             scenario_id    INTEGER NOT NULL REFERENCES scenarios(id),
             verdict        TEXT,           -- pass | fail | null(unjudged)
@@ -71,40 +78,71 @@ def init_schema() -> None:
         );
 
         CREATE TABLE IF NOT EXISTS messages (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            id               SERIAL PRIMARY KEY,
             conversation_id  INTEGER NOT NULL REFERENCES conversations(id),
             turn_index       INTEGER NOT NULL,
             role             TEXT NOT NULL,   -- tester | agent
             content          TEXT,
             trace_json       TEXT
         );
+
+        -- Customer -> agent -> test cases. A customer_agents row IS the testing context:
+        -- the same agent onboarded for two customers is two rows, tested separately.
+        CREATE TABLE IF NOT EXISTS customers (
+            id          SERIAL PRIMARY KEY,
+            name        TEXT NOT NULL UNIQUE,
+            created_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS customer_agents (
+            id           SERIAL PRIMARY KEY,
+            customer_id  INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            agent_id     INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            created_at   TEXT NOT NULL,
+            UNIQUE (customer_id, agent_id)
+        );
+
+        -- The persistent test-case library for one customer-agent combination.
+        -- Same columns as `scenarios` (which stays the per-run execution copy).
+        CREATE TABLE IF NOT EXISTS test_cases (
+            id                SERIAL PRIMARY KEY,
+            customer_agent_id INTEGER NOT NULL REFERENCES customer_agents(id) ON DELETE CASCADE,
+            title             TEXT,
+            user_goal         TEXT,
+            test_type         TEXT,   -- support | memory | injection | contradiction | hallucination
+            assigned_fault    TEXT,   -- none | tool_timeout | stale_doc | injection | api_*
+            expected_behavior TEXT,
+            seed_turns_json   TEXT,
+            source            TEXT,   -- ai | user
+            created_at        TEXT NOT NULL
+        );
         """
     )
     conn.commit()
     conn.close()
-    print(f"[db] schema initialized at {DB_PATH}")
+    print("[db] schema initialized")
 
 
 # ---------------------------------------------------------------------------
-# Small query helpers (no ORM). Rows come back as sqlite3.Row (dict-like).
+# Small query helpers (no ORM). Rows come back as dicts.
 # ---------------------------------------------------------------------------
-def get_agent(agent_id: int) -> sqlite3.Row | None:
+def get_agent(agent_id: int) -> dict | None:
     conn = get_conn()
-    row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+    row = conn.execute("SELECT * FROM agents WHERE id = %s", (agent_id,)).fetchone()
     conn.close()
     return row
 
 
-def get_agent_by_kind(kind: str) -> sqlite3.Row | None:
+def get_agent_by_kind(kind: str) -> dict | None:
     conn = get_conn()
     row = conn.execute(
-        "SELECT * FROM agents WHERE kind = ? ORDER BY id LIMIT 1", (kind,)
+        "SELECT * FROM agents WHERE kind = %s ORDER BY id LIMIT 1", (kind,)
     ).fetchone()
     conn.close()
     return row
 
 
-def list_agents() -> list[sqlite3.Row]:
+def list_agents() -> list[dict]:
     conn = get_conn()
     rows = conn.execute("SELECT * FROM agents ORDER BY id").fetchall()
     conn.close()
@@ -125,19 +163,19 @@ def insert_agent(
         """INSERT INTO agents
            (name, kind, endpoint_url, auth_header, request_template,
             response_path, description, created_at)
-           VALUES (?,?,?,?,?,?,?,?)""",
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (name, kind, endpoint_url, auth_header, request_template,
          response_path, description, now_iso()),
     )
+    agent_id = cur.fetchone()["id"]
     conn.commit()
-    agent_id = cur.lastrowid
     conn.close()
     return agent_id
 
 
 def update_agent_description(agent_id: int, description: str) -> None:
     conn = get_conn()
-    conn.execute("UPDATE agents SET description = ? WHERE id = ?", (description, agent_id))
+    conn.execute("UPDATE agents SET description = %s WHERE id = %s", (description, agent_id))
     conn.commit()
     conn.close()
 
@@ -148,11 +186,11 @@ import json as _json
 def insert_run(agent_id: int) -> int:
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO runs (agent_id, status, started_at) VALUES (?, 'running', ?)",
+        "INSERT INTO runs (agent_id, status, started_at) VALUES (%s, 'running', %s) RETURNING id",
         (agent_id, now_iso()),
     )
+    run_id = cur.fetchone()["id"]
     conn.commit()
-    run_id = cur.lastrowid
     conn.close()
     return run_id
 
@@ -166,25 +204,25 @@ def update_run(
 ) -> None:
     sets, vals = [], []
     if status is not None:
-        sets.append("status = ?"); vals.append(status)
+        sets.append("status = %s"); vals.append(status)
     if reliability_score is not None:
-        sets.append("reliability_score = ?"); vals.append(reliability_score)
+        sets.append("reliability_score = %s"); vals.append(reliability_score)
     if breakdown_json is not None:
-        sets.append("breakdown_json = ?"); vals.append(breakdown_json)
+        sets.append("breakdown_json = %s"); vals.append(breakdown_json)
     if finished:
-        sets.append("finished_at = ?"); vals.append(now_iso())
+        sets.append("finished_at = %s"); vals.append(now_iso())
     if not sets:
         return
     vals.append(run_id)
     conn = get_conn()
-    conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE id = ?", vals)
+    conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE id = %s", vals)
     conn.commit()
     conn.close()
 
 
-def get_run(run_id: int) -> sqlite3.Row | None:
+def get_run(run_id: int) -> dict | None:
     conn = get_conn()
-    row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    row = conn.execute("SELECT * FROM runs WHERE id = %s", (run_id,)).fetchone()
     conn.close()
     return row
 
@@ -195,13 +233,13 @@ def insert_scenario(run_id: int, s: dict) -> int:
         """INSERT INTO scenarios
            (run_id, title, user_goal, test_type, assigned_fault,
             expected_behavior, seed_turns_json)
-           VALUES (?,?,?,?,?,?,?)""",
+           VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (run_id, s.get("title"), s.get("user_goal"), s.get("test_type"),
          s.get("assigned_fault"), s.get("expected_behavior"),
          _json.dumps(s.get("seed_turns", []))),
     )
+    sid = cur.fetchone()["id"]
     conn.commit()
-    sid = cur.lastrowid
     conn.close()
     return sid
 
@@ -209,11 +247,11 @@ def insert_scenario(run_id: int, s: dict) -> int:
 def insert_conversation(run_id: int, scenario_id: int) -> int:
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO conversations (run_id, scenario_id) VALUES (?, ?)",
+        "INSERT INTO conversations (run_id, scenario_id) VALUES (%s, %s) RETURNING id",
         (run_id, scenario_id),
     )
+    cid = cur.fetchone()["id"]
     conn.commit()
-    cid = cur.lastrowid
     conn.close()
     return cid
 
@@ -224,43 +262,43 @@ def insert_message(
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO messages (conversation_id, turn_index, role, content, trace_json)
-           VALUES (?,?,?,?,?)""",
+           VALUES (%s,%s,%s,%s,%s) RETURNING id""",
         (conversation_id, turn_index, role, content,
          _json.dumps(trace) if trace is not None else None),
     )
+    mid = cur.fetchone()["id"]
     conn.commit()
-    mid = cur.lastrowid
     conn.close()
     return mid
 
 
-def get_scenario(scenario_id: int) -> sqlite3.Row | None:
+def get_scenario(scenario_id: int) -> dict | None:
     conn = get_conn()
-    row = conn.execute("SELECT * FROM scenarios WHERE id = ?", (scenario_id,)).fetchone()
+    row = conn.execute("SELECT * FROM scenarios WHERE id = %s", (scenario_id,)).fetchone()
     conn.close()
     return row
 
 
-def get_conversation(conversation_id: int) -> sqlite3.Row | None:
+def get_conversation(conversation_id: int) -> dict | None:
     conn = get_conn()
-    row = conn.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+    row = conn.execute("SELECT * FROM conversations WHERE id = %s", (conversation_id,)).fetchone()
     conn.close()
     return row
 
 
-def get_conversations_for_run(run_id: int) -> list[sqlite3.Row]:
+def get_conversations_for_run(run_id: int) -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT * FROM conversations WHERE run_id = ? ORDER BY id", (run_id,)
+        "SELECT * FROM conversations WHERE run_id = %s ORDER BY id", (run_id,)
     ).fetchall()
     conn.close()
     return rows
 
 
-def get_messages(conversation_id: int) -> list[sqlite3.Row]:
+def get_messages(conversation_id: int) -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT * FROM messages WHERE conversation_id = ? ORDER BY turn_index, id",
+        "SELECT * FROM messages WHERE conversation_id = %s ORDER BY turn_index, id",
         (conversation_id,),
     ).fetchall()
     conn.close()
@@ -278,8 +316,8 @@ def update_conversation_verdict(
     conn = get_conn()
     conn.execute(
         """UPDATE conversations
-           SET verdict=?, severity=?, recovered=?, scores_json=?, evidence=?
-           WHERE id=?""",
+           SET verdict=%s, severity=%s, recovered=%s, scores_json=%s, evidence=%s
+           WHERE id=%s""",
         (verdict, severity,
          (None if recovered is None else (1 if recovered else 0)),
          _json.dumps(scores) if scores is not None else None,
@@ -295,12 +333,12 @@ def update_conversation_fix(
     conn = get_conn()
     if evidence is not None:
         conn.execute(
-            "UPDATE conversations SET explanation=?, suggested_fix=?, evidence=? WHERE id=?",
+            "UPDATE conversations SET explanation=%s, suggested_fix=%s, evidence=%s WHERE id=%s",
             (explanation, suggested_fix, evidence, conversation_id),
         )
     else:
         conn.execute(
-            "UPDATE conversations SET explanation=?, suggested_fix=? WHERE id=?",
+            "UPDATE conversations SET explanation=%s, suggested_fix=%s WHERE id=%s",
             (explanation, suggested_fix, conversation_id),
         )
     conn.commit()
@@ -357,17 +395,158 @@ def build_conversation_payload(conversation_id: int) -> dict | None:
 
 def run_counts(run_id: int) -> dict:
     conn = get_conn()
-    scen = conn.execute("SELECT COUNT(*) c FROM scenarios WHERE run_id=?", (run_id,)).fetchone()["c"]
-    convs = conn.execute("SELECT COUNT(*) c FROM conversations WHERE run_id=?", (run_id,)).fetchone()["c"]
+    scen = conn.execute("SELECT COUNT(*) c FROM scenarios WHERE run_id=%s", (run_id,)).fetchone()["c"]
+    convs = conn.execute("SELECT COUNT(*) c FROM conversations WHERE run_id=%s", (run_id,)).fetchone()["c"]
     msgs = conn.execute(
-        "SELECT COUNT(*) c FROM messages m JOIN conversations c ON m.conversation_id=c.id WHERE c.run_id=?",
+        "SELECT COUNT(*) c FROM messages m JOIN conversations c ON m.conversation_id=c.id WHERE c.run_id=%s",
         (run_id,),
     ).fetchone()["c"]
     judged = conn.execute(
-        "SELECT COUNT(*) c FROM conversations WHERE run_id=? AND verdict IS NOT NULL", (run_id,)
+        "SELECT COUNT(*) c FROM conversations WHERE run_id=%s AND verdict IS NOT NULL", (run_id,)
     ).fetchone()["c"]
     conn.close()
     return {"scenarios": scen, "conversations": convs, "messages": msgs, "judged": judged}
+
+
+# ---------------------------------------------------------------------------
+# Customer -> agent -> test cases.
+# ---------------------------------------------------------------------------
+def get_or_create_customer(name: str) -> int:
+    """Customer id for `name`, inserting the row the first time. Idempotent."""
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO customers (name, created_at) VALUES (%s, %s)
+           ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+           RETURNING id""",
+        (name, now_iso()),
+    )
+    cid = cur.fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return cid
+
+
+def get_agent_by_name(name: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM agents WHERE name = %s ORDER BY id LIMIT 1", (name,)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def get_or_create_customer_agent(customer_id: int, agent_id: int) -> int:
+    """Id of the customer-agent testing context, inserting it the first time.
+
+    This row — not the agent — is what test cases hang off, so the same agent
+    onboarded for two customers stays two separate contexts.
+    """
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO customer_agents (customer_id, agent_id, created_at)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (customer_id, agent_id) DO UPDATE SET customer_id = EXCLUDED.customer_id
+           RETURNING id""",
+        (customer_id, agent_id, now_iso()),
+    )
+    caid = cur.fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return caid
+
+
+def list_customer_agents() -> list[dict]:
+    """Every customer-agent combination, with the customer and agent names joined in."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT ca.id, ca.customer_id, ca.agent_id,
+                  c.name AS customer_name, a.name AS agent_name
+           FROM customer_agents ca
+           JOIN customers c ON c.id = ca.customer_id
+           JOIN agents a    ON a.id = ca.agent_id
+           ORDER BY c.id, a.id"""
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def insert_test_case(customer_agent_id: int, tc: dict, source: str = "ai") -> int:
+    """Store one generated/edited test case against a customer-agent combination."""
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO test_cases
+           (customer_agent_id, title, user_goal, test_type, assigned_fault,
+            expected_behavior, seed_turns_json, source, created_at)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (customer_agent_id, tc.get("title"), tc.get("user_goal"), tc.get("test_type"),
+         tc.get("assigned_fault"), tc.get("expected_behavior"),
+         _json.dumps(tc.get("seed_turns", [])), source, now_iso()),
+    )
+    tid = cur.fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return tid
+
+
+def get_customer_agent(customer_agent_id: int) -> dict | None:
+    """One customer-agent combination with the customer and agent names joined in."""
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT ca.id, ca.customer_id, ca.agent_id,
+                  c.name AS customer_name, a.name AS agent_name
+           FROM customer_agents ca
+           JOIN customers c ON c.id = ca.customer_id
+           JOIN agents a    ON a.id = ca.agent_id
+           WHERE ca.id = %s""",
+        (customer_agent_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def default_customer_agent(agent_id: int) -> int:
+    """The customer-agent context for an agent connected ad-hoc (no customer chosen).
+
+    New agents from the "Connect Your AI Agent" flow have no customer yet, but test cases
+    hang off a customer_agents row — so they go under a reserved UNASSIGNED_CUSTOMER.
+    Keeps one storage path for both flows.
+    """
+    return get_or_create_customer_agent(get_or_create_customer(UNASSIGNED_CUSTOMER), agent_id)
+
+
+def replace_test_cases(customer_agent_id: int, cases: list[dict], sources: list[str] | None = None) -> int:
+    """Make `cases` the stored suite for THIS combination only. Returns how many were saved.
+
+    Scoped by customer_agent_id, so saving Customer 1 / NorthBank never touches
+    Customer 2 / NorthBank. Replaces in one transaction.
+    """
+    conn = get_conn()
+    conn.execute("DELETE FROM test_cases WHERE customer_agent_id = %s", (customer_agent_id,))
+    ts = now_iso()
+    for i, tc in enumerate(cases):
+        source = (sources[i] if sources and i < len(sources) else None) or "ai"
+        conn.execute(
+            """INSERT INTO test_cases
+               (customer_agent_id, title, user_goal, test_type, assigned_fault,
+                expected_behavior, seed_turns_json, source, created_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (customer_agent_id, tc.get("title"), tc.get("user_goal"), tc.get("test_type"),
+             tc.get("assigned_fault"), tc.get("expected_behavior"),
+             _json.dumps(tc.get("seed_turns", [])), source, ts),
+        )
+    conn.commit()
+    conn.close()
+    return len(cases)
+
+
+def get_test_cases(customer_agent_id: int) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM test_cases WHERE customer_agent_id = %s ORDER BY id",
+        (customer_agent_id,),
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 if __name__ == "__main__":

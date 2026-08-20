@@ -24,9 +24,11 @@ def _startup() -> None:
     # Make sure the DB + tables exist before any request lands.
     init_schema()
     # Seed the sample RAG agent so runs can target agent_id immediately.
-    from app.core.adapter import seed_sample_agent
+    from app.core.adapter import seed_inventory, seed_sample_agent
 
     seed_sample_agent()
+    # Customers + their agents from backend/inventory.yaml (after the sample agent).
+    seed_inventory()
 
 
 @app.get("/health")
@@ -34,8 +36,9 @@ def health() -> dict:
     return {"ok": True}
 
 
-from app.routers import agents, conversations, runs  # noqa: E402
+from app.routers import agents, conversations, inventory, runs  # noqa: E402
 
 app.include_router(runs.router)
 app.include_router(agents.router)
 app.include_router(conversations.router)
+app.include_router(inventory.router)

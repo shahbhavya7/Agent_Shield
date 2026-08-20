@@ -111,7 +111,7 @@ export default function Home() {
             &ldquo;Before you deploy your AI agent, crash-test it.&rdquo;
           </p>
           <div className="mt-10 flex flex-col justify-center gap-4 sm:flex-row">
-            <Link href="/dashboard">
+            <Link href="/start">
               <motion.span
                 whileHover={{ scale: 1.02 }}
                 whileTap={{ scale: 0.98 }}
@@ -229,7 +229,7 @@ export default function Home() {
             Ship AI with confidence.
           </h2>
           <p className="mt-4 max-w-xl text-base text-[#9CA3AF]">Stress-test your AI agent before your users do.</p>
-          <Link href="/dashboard" className="mt-8">
+          <Link href="/start" className="mt-8">
             <motion.span
               whileHover={{ scale: 1.03 }}
               whileTap={{ scale: 0.98 }}

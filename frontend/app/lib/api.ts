@@ -45,6 +45,7 @@ export interface RunStatus {
 }
 
 // One test case in the reviewable suite — mirrors a backend `scenarios` row.
+// `source` is carried through so a reloaded suite still distinguishes AI from user cases.
 export interface TestCase {
   title: string;
   user_goal: string;
@@ -52,6 +53,7 @@ export interface TestCase {
   assigned_fault: string;
   expected_behavior: string;
   seed_turns: string[];
+  source?: "ai" | "user";
 }
 
 export interface Trace {
@@ -110,6 +112,23 @@ export interface Report {
   is_demo?: boolean;
 }
 
+// One customer and the agents onboarded for them (backend/inventory.yaml).
+export interface InventoryAgent {
+  key: string;
+  name: string;
+  customer_agent_id: number | null;
+  agent_id: number | null;
+}
+
+export interface InventoryCustomer {
+  name: string;
+  agents: InventoryAgent[];
+}
+
+export interface Inventory {
+  customers: InventoryCustomer[];
+}
+
 // ---- calls ----
 export function registerAgent(body: {
   name: string;
@@ -150,11 +169,15 @@ export function createRun(
   tests: string[],
   guidance = "",
   knowledge = "",
-  scenarios: TestCase[] = []
+  scenarios: TestCase[] = [],
+  customerAgentId: number | null = null
 ): Promise<{ run_id: number }> {
   return req("/runs", {
     method: "POST",
-    body: JSON.stringify({ agent_id: agentId, tests, guidance, knowledge, scenarios }),
+    body: JSON.stringify({
+      agent_id: agentId, tests, guidance, knowledge, scenarios,
+      customer_agent_id: customerAgentId,
+    }),
   });
 }
 
@@ -168,4 +191,49 @@ export function getReport(runId: number): Promise<Report> {
 
 export function getDemoReport(): Promise<Report> {
   return req(`/runs/demo/report`);
+}
+
+// Customer -> agents combinations from backend/inventory.yaml (see /inventory).
+export function getInventory(): Promise<Inventory> {
+  return req("/inventory");
+}
+
+// The test cases already stored for one customer-agent combination (may be empty).
+export interface StoredTestCases {
+  customer_agent_id: number;
+  customer_name: string;
+  agent_id: number;
+  agent_name: string;
+  scenarios: TestCase[];
+}
+
+export function getStoredTestCases(customerAgentId: number): Promise<StoredTestCases> {
+  return req(`/inventory/${customerAgentId}/test-cases`);
+}
+
+// Save the reviewed suite without running it (same storage path as createRun).
+export function saveTestCases(
+  agentId: number,
+  scenarios: TestCase[],
+  customerAgentId: number | null = null
+): Promise<{ customer_agent_id: number; saved: number }> {
+  return req("/runs/test-cases", {
+    method: "POST",
+    body: JSON.stringify({ agent_id: agentId, scenarios, customer_agent_id: customerAgentId }),
+  });
+}
+
+// Generate ONE test case from the user's description (Add Test Case → Generate with AI).
+export function generateOneScenario(
+  agentId: number,
+  description: string,
+  testType: string,
+  assignedFault: string
+): Promise<{ scenario: TestCase }> {
+  return req("/runs/scenarios/one", {
+    method: "POST",
+    body: JSON.stringify({
+      agent_id: agentId, description, test_type: testType, assigned_fault: assignedFault,
+    }),
+  });
 }

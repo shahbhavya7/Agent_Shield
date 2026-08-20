@@ -38,6 +38,7 @@ import {
   Pencil,
   Trash2,
   Wand2,
+  Save,
 } from "lucide-react";
 import {
   createRun,
@@ -46,6 +47,9 @@ import {
   getReport,
   getRun,
   getDemoReport,
+  getStoredTestCases,
+  saveTestCases,
+  generateOneScenario,
   probeAgent,
   registerAgent,
   type Message,
@@ -71,6 +75,9 @@ const TEST_CATEGORIES = [
   { label: "Contradiction", icon: ScanSearch, type: "contradiction" },
   { label: "API / System Failure", icon: Clock, type: "system_failure" },
 ];
+
+// Test types used when an existing combination has no stored suite and we generate one.
+const defaultTypes = TEST_CATEGORIES.filter((c) => c.type !== "system_failure").map((c) => c.type);
 
 const VERIFICATION_STEPS = [
   "Registering agent…",
@@ -101,6 +108,16 @@ const shapes = [
 ];
 
 type Step = "connect" | "verifying" | "configure" | "review" | "running" | "results";
+
+// Set when arriving from Existing Agent Testing: which customer-agent combination is being
+// tested. Everything downstream keys off customerAgentId, never the agent name alone.
+type CustomerAgent = {
+  customerAgentId: number;
+  agentId: number;
+  customer: string;
+  agentName: string;
+  queued: number;
+};
 
 // A test case in the review stage: the backend scenario shape + local review metadata.
 type ReviewCase = TestCase & {
@@ -276,6 +293,7 @@ export default function DashboardPage() {
   );
   const [guidance, setGuidance] = useState("");
 
+  const [context, setContext] = useState<CustomerAgent | null>(null);
   const [agentId, setAgentId] = useState<number | null>(null);
   const [runId, setRunId] = useState<number | null>(null);
   const [counts, setCounts] = useState<RunCounts | null>(null);
@@ -287,8 +305,16 @@ export default function DashboardPage() {
   const [testCases, setTestCases] = useState<ReviewCase[]>([]);
   const [generating, setGenerating] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [savedNote, setSavedNote] = useState<string | null>(null);
   const [editing, setEditing] = useState<ReviewCase | null>(null); // add/edit modal draft
   const [editingIsNew, setEditingIsNew] = useState(false);
+  // Add Test Case dialog: write it yourself, or describe it and let the LLM draft it.
+  const [addMode, setAddMode] = useState<"manual" | "ai">("manual");
+  const [caseBrief, setCaseBrief] = useState("");
+  const [draftingCase, setDraftingCase] = useState(false);
+  // Regenerate asks first: add the new cases to the stored ones, or replace them.
+  const [regenAsk, setRegenAsk] = useState(false);
   // Config the current suite was generated from — lets us skip pointless regeneration
   // when the user just navigates back and forth without changing anything.
   const [suiteConfig, setSuiteConfig] = useState("");
@@ -303,6 +329,8 @@ export default function DashboardPage() {
     setSelectedTests((prev) => (prev.includes(label) ? prev.filter((i) => i !== label) : [...prev, label]));
 
   const handleReset = () => {
+    setContext(null);
+    window.history.replaceState({}, "", "/dashboard");
     setStep("connect");
     setApiKey("");
     setKnowledgeText("");
@@ -322,7 +350,49 @@ export default function DashboardPage() {
     setEditing(null);
     setGenerating(false);
     setStarting(false);
+    setSaving(false);
+    setSavedNote(null);
   };
+
+  // --- Existing Agent Testing entry: ?ca=<customer_agent_id>&agent=&customer=&agentName= ---
+  // Connect + Verify are already done for a registered agent, so we go straight to the
+  // shared Review Test Cases step with that combination's stored suite.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    const ca = Number(q.get("ca"));
+    const aid = Number(q.get("agent"));
+    if (!ca || !aid) return;
+
+    const ctx: CustomerAgent = {
+      customerAgentId: ca,
+      agentId: aid,
+      customer: q.get("customer") || "",
+      agentName: q.get("agentName") || "",
+      queued: Number(q.get("queued")) || 1,
+    };
+    setContext(ctx);
+    setAgentId(aid);
+    setStep("review");
+    setGenerating(true);
+
+    (async () => {
+      try {
+        const stored = await getStoredTestCases(ca);
+        let scenarios = stored.scenarios;
+        // Nothing stored yet → generate now rather than showing an empty review page.
+        if (!scenarios.length) {
+          scenarios = (await generateScenarios(aid, defaultTypes, "", "")).scenarios;
+        }
+        setTestCases(
+          scenarios.map((sc) => ({ ...sc, uid: nextUid(), source: sc.source || "ai" }))
+        );
+      } catch (e) {
+        setError(`Couldn't load test cases: ${(e as Error).message}`);
+      } finally {
+        setGenerating(false);
+      }
+    })();
+  }, []);
 
   // --- Verify: register + real probe, with a staged animation ---
   const handleVerifyConnection = async () => {
@@ -374,7 +444,7 @@ export default function DashboardPage() {
   const currentConfig = () => JSON.stringify([selectedTypes().sort(), guidance.trim()]);
 
   // --- Stage 1: generate the suite for review. Nothing is executed here. ---
-  const handleGenerate = async (regenerate = false) => {
+  const handleGenerate = async (regenerate = false, mode: "keep" | "replace" = "replace") => {
     if (!agentId || generating) return;
     if (!regenerate && !canGenerate) return;
     setError(null);
@@ -389,8 +459,21 @@ export default function DashboardPage() {
     try {
       const { scenarios } = await generateScenarios(agentId, selectedTypes(), guidance, knowledgeText);
       const fresh: ReviewCase[] = scenarios.map((sc) => ({ ...sc, uid: nextUid(), source: "ai" }));
-      // Regeneration replaces only the AI-generated cases — the user's own survive.
-      setTestCases((prev) => [...fresh, ...prev.filter((c) => c.source === "user")]);
+      if (regenerate) {
+        // Keep = add the new cases to the current ones; Replace = the new ones stand alone.
+        const next = mode === "keep" ? [...testCases, ...fresh] : fresh;
+        setTestCases(next);
+        // Persist right away so the database matches what is on screen.
+        const { saved } = await saveTestCases(agentId, suitePayload(next), context?.customerAgentId ?? null);
+        setSavedNote(
+          mode === "keep"
+            ? `Added ${fresh.length} new test case${fresh.length === 1 ? "" : "s"} — ${saved} stored in total.`
+            : `Replaced the stored suite — ${saved} test case${saved === 1 ? "" : "s"} stored.`
+        );
+      } else {
+        // First generation for this config — unchanged behaviour.
+        setTestCases((prev) => [...fresh, ...prev.filter((c) => c.source === "user")]);
+      }
       setSuiteConfig(currentConfig());
     } catch (e) {
       setError(`Couldn't generate test cases: ${(e as Error).message}`);
@@ -400,15 +483,42 @@ export default function DashboardPage() {
     }
   };
 
-  // --- Stage 3: execute exactly the reviewed suite, then poll ---
+  // The reviewed suite in the backend's shape — `source` is kept so the stored copy still
+  // distinguishes AI-generated from user-added cases.
+  const suitePayload = (list: ReviewCase[] = testCases): TestCase[] =>
+    list.map(({ uid: _uid, edited: _e, ...tc }) => tc);
+
+  // --- Save the reviewed suite to PostgreSQL without running it ---
+  const handleSaveTestCases = async () => {
+    if (!agentId || !testCases.length || saving || starting) return;
+    setError(null);
+    setSavedNote(null);
+    setSaving(true);
+    try {
+      const { saved } = await saveTestCases(agentId, suitePayload(), context?.customerAgentId ?? null);
+      setSavedNote(`Saved — ${saved} test case${saved === 1 ? "" : "s"} stored for this agent.`);
+    } catch (e) {
+      setError(`Couldn't save test cases: ${(e as Error).message}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // --- Stage 3: save the reviewed suite, then execute exactly it, then poll ---
   const handleRunTest = async () => {
     if (!canRunTest || !agentId) return;
     setError(null);
+    setSavedNote(null);
     setStarting(true);
-    // Strip local-only review metadata; send the backend scenario shape.
-    const suite: TestCase[] = testCases.map(({ uid: _uid, source: _s, edited: _e, ...tc }) => tc);
+    const suite: TestCase[] = suitePayload();
     try {
-      const { run_id } = await createRun(agentId, selectedTypes(), guidance, knowledgeText, suite);
+      setSaving(true);
+      await saveTestCases(agentId, suite, context?.customerAgentId ?? null);
+      setSaving(false);
+      const { run_id } = await createRun(
+        agentId, selectedTypes(), guidance, knowledgeText, suite,
+        context?.customerAgentId ?? null
+      );
       setRunId(run_id);
       setCounts(null);
       setReport(null);
@@ -416,6 +526,7 @@ export default function DashboardPage() {
     } catch (e) {
       setError(`Couldn't start run: ${(e as Error).message}`);
     } finally {
+      setSaving(false);
       setStarting(false);
     }
   };
@@ -424,6 +535,27 @@ export default function DashboardPage() {
   const openAddCase = () => {
     setEditing(emptyCase());
     setEditingIsNew(true);
+    setAddMode("manual");
+    setCaseBrief("");
+  };
+
+  // Draft one case with the LLM from the user's description, then drop it into the same
+  // form so they can review/tweak it before adding it to the suite.
+  const handleDraftCase = async () => {
+    if (!agentId || !editing || draftingCase) return;
+    setError(null);
+    setDraftingCase(true);
+    try {
+      const { scenario } = await generateOneScenario(
+        agentId, caseBrief.trim(), editing.test_type, editing.assigned_fault
+      );
+      setEditing({ ...editing, ...scenario, uid: editing.uid, source: "user" });
+      setAddMode("manual");
+    } catch (e) {
+      setError(`Couldn't draft a test case: ${(e as Error).message}`);
+    } finally {
+      setDraftingCase(false);
+    }
   };
   const openEditCase = (c: ReviewCase) => {
     setEditing({ ...c, seed_turns: [...c.seed_turns] });
@@ -880,6 +1012,22 @@ export default function DashboardPage() {
                       <p className="mt-2 text-xs text-slate-500">
                         {aiCount} AI-generated · {userCount} user-added · nothing has run yet
                       </p>
+                      {context && (
+                        <p className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                          <span className="rounded-full border border-white/20 bg-white/4 px-3 py-1 font-medium text-[#F8FAFC]">
+                            {context.customer}
+                          </span>
+                          <span className="text-slate-600">→</span>
+                          <span className="rounded-full border border-white/12 bg-white/2 px-3 py-1 text-[#9CA3AF]">
+                            {context.agentName}
+                          </span>
+                          {context.queued > 1 && (
+                            <span className="text-slate-500">
+                              (1 of {context.queued} selected — parallel execution comes next)
+                            </span>
+                          )}
+                        </p>
+                      )}
                     </div>
                     <button
                       onClick={() => setStep("configure")}
@@ -985,7 +1133,7 @@ export default function DashboardPage() {
                       Add Test Case
                     </button>
                     <button
-                      onClick={() => handleGenerate(true)}
+                      onClick={() => setRegenAsk(true)}
                       disabled={generating || starting}
                       className="flex flex-1 items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-6 py-3 text-sm font-medium text-[#F8FAFC] transition-all duration-300 hover:border-white/40 hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-30"
                     >
@@ -993,28 +1141,40 @@ export default function DashboardPage() {
                       {generating ? "Regenerating…" : "Regenerate Test Cases"}
                     </button>
                   </div>
-                  {userCount > 0 && (
-                    <p className="mt-2 text-center text-xs text-slate-500">
-                      Regenerating replaces the AI-generated cases only — your {userCount} added case
-                      {userCount === 1 ? "" : "s"} stay.
-                    </p>
-                  )}
+                  <p className="mt-2 text-center text-xs text-slate-500">
+                    Regenerating asks whether to add the new cases to this suite or replace it.
+                  </p>
 
                   <div className="mt-8 border-t border-white/10 pt-6">
                     <p className="text-center text-sm font-medium text-[#F8FAFC]">
                       Final test suite: {testCases.length} test case{testCases.length === 1 ? "" : "s"}
                     </p>
-                    <motion.button
-                      whileHover={{ scale: canRunTest ? 1.02 : 1 }}
-                      whileTap={{ scale: canRunTest ? 0.98 : 1 }}
-                      transition={{ duration: 0.3 }}
-                      onClick={handleRunTest}
-                      disabled={!canRunTest}
-                      className="mt-4 flex w-full items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-8 py-4 text-base font-medium text-[#F8FAFC] backdrop-blur-md transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:shadow-none"
-                    >
-                      {starting ? <Loader2 className="h-5 w-5 animate-spin" strokeWidth={1.5} /> : <PlayCircle className="h-5 w-5" strokeWidth={1.5} />}
-                      {starting ? "Starting run…" : "Run Reliability Test"}
-                    </motion.button>
+                    <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+                      <button
+                        onClick={handleSaveTestCases}
+                        disabled={!testCases.length || saving || starting || generating}
+                        className="flex flex-1 items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-6 py-3 text-sm font-medium text-[#F8FAFC] transition-all duration-300 hover:border-white/40 hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-30"
+                      >
+                        {saving && !starting ? <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} /> : <Save className="h-4 w-4" strokeWidth={1.5} />}
+                        {saving && !starting ? "Saving…" : "Save Test Cases"}
+                      </button>
+                      <motion.button
+                        whileHover={{ scale: canRunTest ? 1.02 : 1 }}
+                        whileTap={{ scale: canRunTest ? 0.98 : 1 }}
+                        transition={{ duration: 0.3 }}
+                        onClick={handleRunTest}
+                        disabled={!canRunTest || saving}
+                        className="flex flex-1 items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-6 py-3 text-sm font-medium text-[#F8FAFC] transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:shadow-none"
+                      >
+                        {starting ? <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} /> : <PlayCircle className="h-4 w-4" strokeWidth={1.5} />}
+                        {starting ? (saving ? "Saving test cases…" : "Starting run…") : "Run Reliability Test"}
+                      </motion.button>
+                    </div>
+                    {savedNote && (
+                      <p className="mt-3 rounded-lg border border-[#34D399]/35 bg-[#34D399]/10 px-4 py-2.5 text-center text-xs text-[#34D399]">
+                        {savedNote}
+                      </p>
+                    )}
                     {testCases.length === 0 && (
                       <p className="mt-3 text-center text-xs text-[#FBBF24]">
                         Add or regenerate at least one test case before running the reliability test.
@@ -1229,6 +1389,58 @@ export default function DashboardPage() {
           )}
         </AnimatePresence>
 
+        {/* Regenerate: add the new cases to the stored suite, or replace it. */}
+        <AnimatePresence>
+          {regenAsk && (
+            <motion.div
+              key="regen-modal"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="fixed inset-0 z-[60] flex items-center justify-center bg-[#0B0B0F]/80 p-6 backdrop-blur-sm"
+              onClick={() => setRegenAsk(false)}
+            >
+              <motion.div
+                initial={{ opacity: 0, y: 16 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 16 }}
+                transition={{ duration: 0.25 }}
+                onClick={(e) => e.stopPropagation()}
+                className="w-full max-w-lg rounded-xl border border-white/12 bg-[#0B0B0F] p-8 shadow-[0_24px_60px_rgba(0,0,0,0.6)]"
+              >
+                <div className="flex items-center justify-between">
+                  <h3 className="font-heading text-lg font-medium text-[#F8FAFC]">Regenerate Test Cases</h3>
+                  <button onClick={() => setRegenAsk(false)} className="text-slate-400 transition-colors hover:text-[#F87171]">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                <p className="mt-3 text-sm text-[#9CA3AF]">
+                  What should happen to the {testCases.length} test case{testCases.length === 1 ? "" : "s"} you
+                  already have? Either way the result is saved to the database.
+                </p>
+
+                <div className="mt-6 flex flex-col gap-3 sm:flex-row">
+                  <button
+                    onClick={() => { setRegenAsk(false); handleGenerate(true, "keep"); }}
+                    className="flex flex-1 flex-col items-center gap-1 rounded-xl border border-white/20 bg-white/4 px-5 py-4 text-sm font-medium text-[#F8FAFC] transition-all duration-300 hover:border-white/40 hover:bg-white/12"
+                  >
+                    Keep and add
+                    <span className="text-xs font-normal text-slate-500">New cases join the current ones</span>
+                  </button>
+                  <button
+                    onClick={() => { setRegenAsk(false); handleGenerate(true, "replace"); }}
+                    className="flex flex-1 flex-col items-center gap-1 rounded-xl border border-white/20 bg-white/4 px-5 py-4 text-sm font-medium text-[#F8FAFC] transition-all duration-300 hover:border-[#F87171]/50 hover:bg-[#F87171]/10"
+                  >
+                    Replace all
+                    <span className="text-xs font-normal text-slate-500">Current cases are discarded</span>
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Add / edit a test case — same dialog for both. */}
         <AnimatePresence>
           {editing && (
@@ -1258,8 +1470,30 @@ export default function DashboardPage() {
                   </button>
                 </div>
 
+                {editingIsNew && (
+                  <div className="mt-5 flex gap-2 rounded-full border border-white/12 bg-white/2 p-1">
+                    {([
+                      { id: "manual", label: "Write it myself", icon: Pencil },
+                      { id: "ai", label: "Generate with AI", icon: Wand2 },
+                    ] as const).map((m) => (
+                      <button
+                        key={m.id}
+                        onClick={() => setAddMode(m.id)}
+                        className={`flex flex-1 items-center justify-center gap-2 rounded-full px-4 py-2 text-xs font-medium transition-all duration-300 ${
+                          addMode === m.id
+                            ? "border border-white/20 bg-white/8 text-[#F8FAFC]"
+                            : "border border-transparent text-slate-400 hover:text-[#F8FAFC]"
+                        }`}
+                      >
+                        <m.icon className="h-3.5 w-3.5" strokeWidth={1.5} />
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
                 <div className="mt-6 flex flex-col gap-5">
-                  <div>
+                  <div className={editingIsNew && addMode === "ai" ? "hidden" : undefined}>
                     <label className="text-xs font-medium text-[#9CA3AF]">Title <span className="text-slate-600">(optional)</span></label>
                     <input
                       value={editing.title}
@@ -1303,7 +1537,33 @@ export default function DashboardPage() {
                     </div>
                   </div>
 
-                  <div>
+                  {editingIsNew && addMode === "ai" && (
+                    <div>
+                      <label className="text-xs font-medium text-[#9CA3AF]">
+                        Describe the test case <span className="text-slate-600">(optional — what should it probe?)</span>
+                      </label>
+                      <textarea
+                        value={caseBrief}
+                        onChange={(e) => setCaseBrief(e.target.value)}
+                        rows={3}
+                        placeholder="e.g. 'Check it doesn't invent a refund window when the policy doc is missing.' Leave blank and AI picks something suitable."
+                        className="mt-2 w-full rounded-lg border border-white/12 bg-white/2 px-4 py-3 text-sm text-[#F8FAFC] outline-none transition-colors focus:border-white/30 placeholder:text-slate-600"
+                      />
+                      <button
+                        onClick={handleDraftCase}
+                        disabled={draftingCase}
+                        className="mt-4 flex w-full items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-6 py-3 text-sm font-medium text-[#F8FAFC] transition-all duration-300 hover:border-white/40 hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-30"
+                      >
+                        {draftingCase ? <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} /> : <Wand2 className="h-4 w-4" strokeWidth={1.5} />}
+                        {draftingCase ? "Drafting test case…" : "Generate Test Case"}
+                      </button>
+                      <p className="mt-3 text-center text-xs text-slate-500">
+                        The draft opens in the form below so you can review it before adding.
+                      </p>
+                    </div>
+                  )}
+
+                  <div className={editingIsNew && addMode === "ai" ? "hidden" : undefined}>
                     <label className="text-xs font-medium text-[#9CA3AF]">
                       Test prompt <span className="text-slate-600">(one user message per line — played in order, max 5)</span>
                     </label>
@@ -1316,7 +1576,7 @@ export default function DashboardPage() {
                     />
                   </div>
 
-                  <div>
+                  <div className={editingIsNew && addMode === "ai" ? "hidden" : undefined}>
                     <label className="text-xs font-medium text-[#9CA3AF]">
                       Expected behavior <span className="text-slate-600">(the reference the judge scores against)</span>
                     </label>
@@ -1329,7 +1589,7 @@ export default function DashboardPage() {
                     />
                   </div>
 
-                  <div>
+                  <div className={editingIsNew && addMode === "ai" ? "hidden" : undefined}>
                     <label className="text-xs font-medium text-[#9CA3AF]">Tester goal <span className="text-slate-600">(optional)</span></label>
                     <input
                       value={editing.user_goal}
@@ -1340,7 +1600,7 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
-                <div className="mt-8 flex gap-3">
+                <div className={`mt-8 flex gap-3 ${editingIsNew && addMode === "ai" ? "hidden" : ""}`}>
                   <button
                     onClick={() => setEditing(null)}
                     className="flex-1 rounded-full border border-white/15 bg-white/2 px-6 py-3 text-sm font-medium text-slate-300 transition-all hover:border-white/30 hover:text-[#F8FAFC]"
@@ -1355,7 +1615,7 @@ export default function DashboardPage() {
                     {editingIsNew ? "Add to suite" : "Save changes"}
                   </button>
                 </div>
-                {!editing.seed_turns.some((t) => t.trim()) && (
+                {!editing.seed_turns.some((t) => t.trim()) && !(editingIsNew && addMode === "ai") && (
                   <p className="mt-3 text-center text-xs text-[#FBBF24]">A test case needs at least one prompt line.</p>
                 )}
               </motion.div>

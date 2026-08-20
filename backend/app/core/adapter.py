@@ -10,14 +10,23 @@ from typing import Any, Optional
 
 import httpx
 
-from app.config import SAMPLE_RAG_BOT_URL
-from app.db import get_agent_by_kind, insert_agent
+from app.config import INVENTORY, SAMPLE_AGENT_URLS, SAMPLE_RAG_BOT_URL, agent_display_name
+from app.db import (
+    get_agent_by_kind,
+    get_agent_by_name,
+    get_or_create_customer,
+    get_or_create_customer_agent,
+    insert_agent,
+)
 
 # The standard request template for our sample RAG agent. Placeholders:
 #   {message} -> JSON-escaped string (sits inside quotes)
 #   {history} -> JSON array          (no quotes)
 #   {faults}  -> JSON array          (no quotes)
 DEFAULT_REQUEST_TEMPLATE = '{"message":"{message}","history":{history},"faults":{faults}}'
+# Internal identifier of the sample RAG agent — matches its /health "service" value and
+# its key in mapping.yaml.
+SAMPLE_RAG_BOT_KEY = "sample_rag_bot"
 DEFAULT_TIMEOUT_S = 30.0
 
 # Agent-cooperative faults (only our sample RAG agent honors these — they travel in the
@@ -71,7 +80,7 @@ def _extract_by_path(data: Any, dot_path: str) -> Any:
 
 
 async def send(
-    agent: Any,  # sqlite3.Row or dict with the agent columns
+    agent: Any,  # an `agents` row (dict) with the agent columns
     message: str,
     history: Optional[list] = None,
     faults: Optional[list] = None,
@@ -83,7 +92,7 @@ async def send(
     """
     history = history or []
     faults = faults or []
-    agent = dict(agent)  # accept sqlite3.Row or dict uniformly
+    agent = dict(agent)  # accept a row or a plain dict uniformly
 
     # System/transport faults are simulated here — the agent is never called, so this works
     # for any black-box endpoint. Record the failure like a normal (bad) turn.
@@ -137,7 +146,8 @@ def seed_sample_agent() -> int:
     if existing:
         return existing["id"]
     return insert_agent(
-        name="Store Customer-Support Agent (RAG)",
+        # Internal identifier -> actual name, resolved via backend/mapping.yaml.
+        name=agent_display_name(SAMPLE_RAG_BOT_KEY),
         kind="sample",
         endpoint_url=SAMPLE_RAG_BOT_URL,
         response_path="reply",
@@ -148,3 +158,32 @@ def seed_sample_agent() -> int:
             "support hours, orders, cancellations, and payment methods."
         ),
     )
+
+
+def seed_inventory() -> int:
+    """Seed customers + their agents from backend/inventory.yaml. Idempotent.
+
+    One `agents` row per distinct agent (matched by name, so NorthBank Support is stored
+    once) and one `customer_agents` row per customer-agent pair — which is what makes
+    "NorthBank Support for Customer 1" and "…for Customer 2" separate testing contexts.
+
+    Call AFTER seed_sample_agent(): that one claims the first kind='sample' row.
+    """
+    pairs = 0
+    for customer in INVENTORY:
+        customer_id = get_or_create_customer(customer["name"])
+        for key in customer["agents"]:
+            name = agent_display_name(key)
+            agent = get_agent_by_name(name)
+            agent_id = agent["id"] if agent else insert_agent(
+                name=name,
+                kind="sample",
+                endpoint_url=SAMPLE_AGENT_URLS.get(key, ""),
+                response_path="reply",
+                request_template=DEFAULT_REQUEST_TEMPLATE,
+                description=f"Sample agent '{key}' from backend/sample_agents/.",
+            )
+            get_or_create_customer_agent(customer_id, agent_id)
+            pairs += 1
+    print(f"[db] inventory seeded: {pairs} customer-agent combinations")
+    return pairs
