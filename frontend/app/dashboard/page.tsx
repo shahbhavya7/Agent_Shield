@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -262,6 +263,7 @@ function CopyButton({ text }: { text: string }) {
 }
 
 export default function DashboardPage() {
+  const router = useRouter();
   const [step, setStep] = useState<Step>("connect");
 
   // Prefilled to our sample RAG agent so the demo is one click.
@@ -328,9 +330,10 @@ export default function DashboardPage() {
   const toggleTest = (label: string) =>
     setSelectedTests((prev) => (prev.includes(label) ? prev.filter((i) => i !== label) : [...prev, label]));
 
+  // "Run New Test" sends the user back to the start choice (new agent vs existing agent).
   const handleReset = () => {
+    router.push("/start");
     setContext(null);
-    window.history.replaceState({}, "", "/dashboard");
     setStep("connect");
     setApiKey("");
     setKnowledgeText("");
