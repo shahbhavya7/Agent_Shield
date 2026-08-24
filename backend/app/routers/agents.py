@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from app.core.adapter import DEFAULT_REQUEST_TEMPLATE
 from app.db import (
     get_agent,
+    get_agent_by_name_and_endpoint,
     insert_agent,
     list_agents,
     set_agent_knowledge,
@@ -55,7 +56,17 @@ def get_one(agent_id: int) -> dict:
 
 @router.post("")
 def register(body: RegisterAgent) -> dict:
-    """Register a custom (black-box) agent. Faults won't be injected; trace = whatever it returns."""
+    """Register a custom (black-box) agent. Faults won't be injected; trace = whatever it returns.
+
+    Re-registering the same name+endpoint returns the existing agent instead of inserting a
+    duplicate, so reconnecting keeps the agent's customer context and saved test cases.
+    """
+    existing = get_agent_by_name_and_endpoint(body.name, body.endpoint_url)
+    if existing:
+        if body.description:
+            update_agent_description(existing["id"], body.description)
+        return {"agent_id": existing["id"]}
+
     agent_id = insert_agent(
         name=body.name,
         kind="custom",

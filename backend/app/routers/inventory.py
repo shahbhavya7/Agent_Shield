@@ -1,9 +1,10 @@
 """/inventory API — the customer -> agents combinations, and their stored test cases.
 
-The combinations come from backend/inventory.yaml (seeded into PostgreSQL at startup),
-so the UI's "Test Existing Agent" table is built from one source. Each agent carries its
-`customer_agent_id` — the id everything downstream keys off, because the same agent
-onboarded for two customers is two separate testing contexts.
+Sample combinations come from backend/inventory.yaml (seeded into PostgreSQL at startup);
+agents connected through "Connect Your AI Agent" are appended straight from PostgreSQL,
+which is the source of truth for them. Each agent carries its `customer_agent_id` — the id
+everything downstream keys off, because the same agent onboarded for two customers is two
+separate testing contexts.
 """
 from fastapi import APIRouter, HTTPException
 
@@ -16,14 +17,16 @@ router = APIRouter(prefix="/inventory", tags=["inventory"])
 @router.get("")
 def get_inventory() -> dict:
     """Customers with their onboarded agents (internal key, display name, and DB ids)."""
-    # (customer name, agent name) -> the seeded customer_agents row.
+    # (customer name, agent name) -> the customer_agents row.
     combos = {(c["customer_name"], c["agent_name"]): c for c in list_customer_agents()}
     customers = []
+    seeded: set[tuple[str, str]] = set()
     for c in INVENTORY:
         agents = []
         for key in c["agents"]:
             name = agent_display_name(key)
             combo = combos.get((c["name"], name))
+            seeded.add((c["name"], name))
             agents.append({
                 "key": key,
                 "name": name,
@@ -31,6 +34,22 @@ def get_inventory() -> dict:
                 "agent_id": combo["agent_id"] if combo else None,
             })
         customers.append({"name": c["name"], "agents": agents})
+
+    # Agents connected through "Connect Your AI Agent" exist only in PostgreSQL — they have
+    # no inventory.yaml entry — so append every combination the seeded loop didn't emit.
+    # Their display name is the agents.name column, so mapping.yaml needs no entry either.
+    dynamic: dict[str, list[dict]] = {}
+    for (customer_name, agent_name), combo in combos.items():
+        if (customer_name, agent_name) in seeded:
+            continue
+        dynamic.setdefault(customer_name, []).append({
+            "key": f"agent-{combo['agent_id']}",
+            "name": agent_name,
+            "customer_agent_id": combo["id"],
+            "agent_id": combo["agent_id"],
+        })
+    # dict order follows list_customer_agents()' ORDER BY, i.e. the order they were created.
+    customers.extend({"name": name, "agents": agents} for name, agents in dynamic.items())
     return {"customers": customers}
 
 
