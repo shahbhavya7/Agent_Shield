@@ -11,8 +11,10 @@ from psycopg.rows import dict_row
 from app.config import DATABASE_URL
 
 
-# Customer name used for agents connected ad-hoc, with no customer selected.
-UNASSIGNED_CUSTOMER = "Unassigned"
+# Customer names for agents connected through "Connect Your AI Agent". There is no login
+# yet, so each newly connected agent gets its own generated "New Customer N" placeholder,
+# to be replaced by the real customer identity once auth exists.
+NEW_CUSTOMER_PREFIX = "New Customer"
 
 
 def get_conn() -> psycopg.Connection:
@@ -500,6 +502,21 @@ def get_or_create_customer(name: str) -> int:
     return cid
 
 
+def get_agent_by_name_and_endpoint(name: str, endpoint_url: str) -> dict | None:
+    """The agent row for this exact name+endpoint, if it was already registered.
+
+    Reconnecting the same agent must reuse its row so its customer context and stored
+    test cases stay attached instead of forking a duplicate.
+    """
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM agents WHERE name = %s AND endpoint_url = %s ORDER BY id LIMIT 1",
+        (name, endpoint_url),
+    ).fetchone()
+    conn.close()
+    return row
+
+
 def get_agent_by_name(name: str) -> dict | None:
     conn = get_conn()
     row = conn.execute(
@@ -579,13 +596,34 @@ def get_customer_agent(customer_agent_id: int) -> dict | None:
 
 
 def default_customer_agent(agent_id: int) -> int:
-    """The customer-agent context for an agent connected ad-hoc (no customer chosen).
+    """The customer-agent context for an agent connected through "Connect Your AI Agent".
 
-    New agents from the "Connect Your AI Agent" flow have no customer yet, but test cases
-    hang off a customer_agents row — so they go under a reserved UNASSIGNED_CUSTOMER.
-    Keeps one storage path for both flows.
+    Test cases hang off a customer_agents row, and these agents have no customer yet, so
+    each one gets its own generated "New Customer N". Creating this row is what makes the
+    agent show up in Existing Agent Testing — which is why it happens on save, not on
+    connect. Reused on every later save, so revisiting the flow adds no duplicates.
     """
-    return get_or_create_customer_agent(get_or_create_customer(UNASSIGNED_CUSTOMER), agent_id)
+    conn = get_conn()
+    like = f"{NEW_CUSTOMER_PREFIX} %"
+    existing = conn.execute(
+        """SELECT ca.id FROM customer_agents ca
+           JOIN customers c ON c.id = ca.customer_id
+           WHERE ca.agent_id = %s AND c.name LIKE %s
+           ORDER BY ca.id LIMIT 1""",
+        (agent_id, like),
+    ).fetchone()
+    if existing:
+        conn.close()
+        return existing["id"]
+    # First save for this agent — take the next free number.
+    taken = conn.execute("SELECT name FROM customers WHERE name LIKE %s", (like,)).fetchall()
+    conn.close()
+    used = [
+        int(tail) for r in taken
+        if (tail := r["name"][len(NEW_CUSTOMER_PREFIX):].strip()).isdigit()
+    ]
+    name = f"{NEW_CUSTOMER_PREFIX} {max(used, default=0) + 1}"
+    return get_or_create_customer_agent(get_or_create_customer(name), agent_id)
 
 
 def replace_test_cases(customer_agent_id: int, cases: list[dict], sources: list[str] | None = None) -> int:
