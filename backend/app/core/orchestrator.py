@@ -1,10 +1,13 @@
-"""Run orchestrator — owns the lifecycle of a single run.
+"""Run orchestrator — owns the lifecycle of a run, and of a batch of parallel runs.
 
-Phase 2:  runner (generate scenarios -> play each, record traces).
-Phase 3:  will extend with judge -> explain_and_fix(failures only) -> scoring.
+`start_run` drives one agent: generate/accept scenarios -> play them -> judge ->
+explain+fix the failures -> score. `start_run_group` fans that out across every agent
+the user selected, so N agents are crash-tested at once against shared concurrency
+ceilings. One agent per run keeps each agent independently scored and reportable.
 """
 import asyncio
 
+from app.config import AGENT_CONCURRENCY, WORK_CONCURRENCY
 from app.core.fixer import explain_and_fix
 from app.core.judge import judge_conversation
 from app.core.runner import run_scenario
@@ -18,7 +21,17 @@ from app.db import (
     update_run,
 )
 
-CONCURRENCY = 3
+# Two levels of bounded concurrency, both process-wide.
+#
+#   _AGENTS  how many selected agents are crash-tested at once (the parallel fan-out).
+#   _WORK    ceiling on in-flight scenario/judge/fix work across EVERY run in flight.
+#
+# _WORK is shared rather than per-run on purpose: a per-run semaphore would multiply by
+# the number of agents, so four parallel agents would quadruple the load we put on the
+# LLM and on the agents under test. Acquisition order is always _AGENTS then _WORK, and
+# _WORK is only ever held around leaf work, so the pair cannot deadlock.
+_AGENTS = asyncio.Semaphore(AGENT_CONCURRENCY)
+_WORK = asyncio.Semaphore(WORK_CONCURRENCY)
 
 
 async def prepare_scenarios(
@@ -31,6 +44,9 @@ async def prepare_scenarios(
     """
     # Resolve the agent's domain profile. Priority: uploaded docs > description >
     # auto-discovery (probe the agent and infer what it does).
+    # Docs uploaded on the Connect step are stored on the agent, so a caller that has no
+    # docs in hand (e.g. the Existing Agent path) still generates grounded test cases.
+    knowledge = knowledge or (agent.get("knowledge") or "")
     description = agent.get("description") or ""
     if not (knowledge and knowledge.strip()):
         from app.core.discover import discover_agent, looks_generic
@@ -83,8 +99,8 @@ async def start_run(
         for s in scenarios:
             s["_id"] = insert_scenario(run_id, s)
 
-        # 3) Play all scenarios concurrently (bounded).
-        sem = asyncio.Semaphore(CONCURRENCY)
+        # 3) Play all scenarios concurrently (bounded by the shared work ceiling).
+        sem = _WORK
 
         async def _guarded(scenario: dict) -> None:
             async with sem:
@@ -126,6 +142,43 @@ async def start_run(
     except Exception as e:
         print(f"[orchestrator] run {run_id} errored: {e}")
         update_run(run_id, status="error", finished=True)
+
+
+async def start_run_group(
+    targets: list[dict],
+    selected_types: list[str],
+    guidance: str = "",
+    knowledge: str = "",
+) -> None:
+    """Drive a whole batch of runs — one per selected agent — concurrently.
+
+    `targets` are already-inserted runs: each item is
+    ``{"run_id": int, "agent_id": int, "scenarios": list[dict] | None}``.
+    The router inserts the rows first so it can hand the client its ids immediately,
+    then hands them here to execute.
+
+    Agents are independent, so one agent erroring never touches the others; each run
+    finalizes its own status and reliability score.
+    """
+    async def _one(target: dict) -> None:
+        async with _AGENTS:
+            run_id = target["run_id"]
+            try:
+                await start_run(
+                    run_id,
+                    target["agent_id"],
+                    selected_types,
+                    guidance,
+                    knowledge,
+                    target.get("scenarios"),
+                )
+            except Exception as e:
+                # start_run already swallows its own failures; this is the last resort
+                # so one dead agent cannot leave the batch hanging in "running".
+                print(f"[orchestrator] run {run_id} in group crashed: {e}")
+                update_run(run_id, status="error", finished=True)
+
+    await asyncio.gather(*(_one(t) for t in targets))
 
 
 async def replay_conversation(conversation_id: int) -> int | None:

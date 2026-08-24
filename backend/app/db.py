@@ -116,6 +116,24 @@ def init_schema() -> None:
             source            TEXT,   -- ai | user
             created_at        TEXT NOT NULL
         );
+
+        -- One "Run Selected Agents" click = one run_groups row holding N runs, one per
+        -- selected agent. Each run keeps its own scenarios, conversations and score, so
+        -- agents stay independently reportable and comparable.
+        CREATE TABLE IF NOT EXISTS run_groups (
+            id          SERIAL PRIMARY KEY,
+            created_at  TEXT NOT NULL
+        );
+
+        ALTER TABLE runs ADD COLUMN IF NOT EXISTS group_id
+            INTEGER REFERENCES run_groups(id);
+        ALTER TABLE runs ADD COLUMN IF NOT EXISTS customer_agent_id
+            INTEGER REFERENCES customer_agents(id);
+
+        -- The agent's own docs, uploaded on the Connect step. Stored so every later
+        -- run for this agent stays grounded without re-uploading the file.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge TEXT;
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge_name TEXT;
         """
     )
     conn.commit()
@@ -180,19 +198,75 @@ def update_agent_description(agent_id: int, description: str) -> None:
     conn.close()
 
 
+def set_agent_knowledge(agent_id: int, knowledge: str, knowledge_name: str | None = None) -> None:
+    """Attach the uploaded docs to the agent so later runs can ground themselves on them."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE agents SET knowledge = %s, knowledge_name = %s WHERE id = %s",
+        (knowledge, knowledge_name, agent_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 import json as _json
 
 
-def insert_run(agent_id: int) -> int:
+def insert_run_group() -> int:
+    """Create the batch that a set of same-click runs belong to."""
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO runs (agent_id, status, started_at) VALUES (%s, 'running', %s) RETURNING id",
-        (agent_id, now_iso()),
+        "INSERT INTO run_groups (created_at) VALUES (%s) RETURNING id", (now_iso(),)
+    )
+    gid = cur.fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return gid
+
+
+def insert_run(
+    agent_id: int,
+    group_id: int | None = None,
+    customer_agent_id: int | None = None,
+) -> int:
+    """One run against one agent. `group_id` ties it to the batch it was launched with."""
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO runs (agent_id, status, started_at, group_id, customer_agent_id)
+           VALUES (%s, 'running', %s, %s, %s) RETURNING id""",
+        (agent_id, now_iso(), group_id, customer_agent_id),
     )
     run_id = cur.fetchone()["id"]
     conn.commit()
     conn.close()
     return run_id
+
+
+def get_runs_for_group(group_id: int) -> list[dict]:
+    """Every run in a batch, oldest first, with the agent and customer names joined in.
+
+    Ordered by id so the response lines up with the order the client sent its targets.
+    """
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT r.*, a.name AS agent_name, c.name AS customer_name
+           FROM runs r
+           JOIN agents a               ON a.id = r.agent_id
+           LEFT JOIN customer_agents ca ON ca.id = r.customer_agent_id
+           LEFT JOIN customers c        ON c.id = ca.customer_id
+           WHERE r.group_id = %s
+           ORDER BY r.id""",
+        (group_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def run_group_exists(group_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT id FROM run_groups WHERE id = %s", (group_id,)).fetchone()
+    conn.close()
+    return row is not None
 
 
 def update_run(

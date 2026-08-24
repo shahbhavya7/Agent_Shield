@@ -200,7 +200,9 @@ Respond in json.
 
 CRITICAL — match the agent's actual domain:
 - Infer the agent's domain, capabilities, and the questions its real users ask STRICTLY from the
-  "Agent under test" description (and any guidance) below.
+  material below, in this order of authority: an "AGENT KNOWLEDGE SOURCE" block (the agent's own
+  docs) outranks everything; the "Agent under test" description is only a fallback for what the
+  docs do not cover. Where the two disagree, the docs win.
 - Do NOT assume it is an e-commerce / store-support agent. Examples: a BANKING agent → transfers,
   wire/ACH limits, overdraft fees, fraud, loan APRs, cards; an HR agent → PTO, payroll, benefits,
   leave; an INSURANCE agent → claims, deductibles, coverage, roadside; a HEALTHCARE agent →
@@ -253,10 +255,21 @@ def _guidance_block(guidance: str) -> str:
     )
 
 
+# How much of the uploaded docs is sent to the generator. The model has a 128k-token
+# context and generation is ONE call per suite, so a whole policy document fits easily —
+# the cap only exists to stop a pathologically large paste.
+MAX_KNOWLEDGE_CHARS = 60000
+
+
 def _knowledge_block(knowledge: str) -> str:
     if not knowledge or not knowledge.strip():
         return ""
-    kb = knowledge.strip()[:6000]  # cap payload
+    kb = knowledge.strip()
+    if len(kb) > MAX_KNOWLEDGE_CHARS:
+        print(
+            f"[scenarios] knowledge truncated: {len(kb)} -> {MAX_KNOWLEDGE_CHARS} chars"
+        )
+        kb = kb[:MAX_KNOWLEDGE_CHARS]
     return (
         "\n\nAGENT KNOWLEDGE SOURCE (the agent's own docs — treat as AUTHORITATIVE ground truth):\n"
         f"{kb}\n"

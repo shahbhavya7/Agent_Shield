@@ -3,7 +3,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.core.adapter import DEFAULT_REQUEST_TEMPLATE
-from app.db import get_agent, insert_agent, list_agents, update_agent_description
+from app.db import (
+    get_agent,
+    insert_agent,
+    list_agents,
+    set_agent_knowledge,
+    update_agent_description,
+)
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -17,12 +23,20 @@ class RegisterAgent(BaseModel):
     description: str | None = None
 
 
+class AgentKnowledge(BaseModel):
+    """The agent's docs, read as text in the browser on the Connect step."""
+    text: str
+    name: str | None = None
+
+
 def _row_to_dict(row) -> dict:
     r = dict(row)
     return {
         "id": r["id"], "name": r["name"], "kind": r["kind"],
         "endpoint_url": r["endpoint_url"], "response_path": r["response_path"],
         "description": r["description"], "created_at": r["created_at"],
+        "knowledge_name": r.get("knowledge_name"),
+        "knowledge_chars": len(r.get("knowledge") or ""),
     }
 
 
@@ -86,3 +100,15 @@ async def discover(agent_id: int) -> dict:
     description = await discover_agent(a)
     update_agent_description(agent_id, description)
     return {"description": description}
+
+
+@router.post("/{agent_id}/knowledge")
+def save_knowledge(agent_id: int, body: AgentKnowledge) -> dict:
+    """Attach the agent's docs, so every later run for it generates grounded test cases.
+
+    Takes the text the browser already read from the file — no server-side file parsing.
+    """
+    if get_agent(agent_id) is None:
+        raise HTTPException(status_code=404, detail=f"agent {agent_id} not found")
+    set_agent_knowledge(agent_id, body.text, body.name)
+    return {"agent_id": agent_id, "knowledge_name": body.name, "chars": len(body.text)}

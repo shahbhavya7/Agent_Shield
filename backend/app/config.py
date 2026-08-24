@@ -21,6 +21,15 @@ DATABASE_URL: str = os.getenv(
 # Demo safety: cap scenarios per run so a live run finishes well under ~90s.
 MAX_SCENARIOS: int = int(os.getenv("MAX_SCENARIOS", "10"))
 
+# --- Concurrency -------------------------------------------------------------
+# How many selected agents are crash-tested at the same time. Each one is an
+# independent run, so this is the width of the parallel fan-out.
+AGENT_CONCURRENCY: int = int(os.getenv("AGENT_CONCURRENCY", "3"))
+# Ceiling on in-flight scenario/judge/fix work across the WHOLE process, shared by
+# every run in flight. Without this, N parallel agents would each open their own
+# window onto the LLM and the agents under test.
+WORK_CONCURRENCY: int = int(os.getenv("WORK_CONCURRENCY", "6"))
+
 # Rough $ per 1K tokens for the agent-under-test, used to estimate run cost.
 # Default is a blended gpt-4o-mini rate; override per model via .env.
 PRICE_PER_1K_TOKENS: float = float(os.getenv("PRICE_PER_1K_TOKENS", "0.0004"))

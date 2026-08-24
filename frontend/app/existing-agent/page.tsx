@@ -50,22 +50,35 @@ export default function ExistingAgent() {
   const toggle = (id: string) =>
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
 
-  // Hand the chosen combination to the dashboard, which loads (or generates) its test
-  // cases and shows them in the same Review Test Cases UI.
+  // Hand every chosen combination to the dashboard, which loads (or generates) each
+  // one's test cases and shows them in the same Review Test Cases UI — one tab per agent.
   const run = (chosen: Combo[]) => {
-    const first = chosen.find((c) => c.customerAgentId !== null);
-    if (!first) {
-      setError("That combination isn't registered in the database yet.");
+    const registered = chosen.filter((c) => c.customerAgentId !== null);
+    if (!registered.length) {
+      setError("None of those combinations are registered in the database yet.");
       return;
     }
+    if (registered.length < chosen.length) {
+      setError(
+        `${chosen.length - registered.length} of the selected combinations aren't registered yet — running the rest.`
+      );
+    }
+    const targets = registered.map((c) => ({
+      ca: c.customerAgentId,
+      agent: c.agentId,
+      customer: c.customer,
+      agentName: c.agentName,
+    }));
+    const first = registered[0];
     const params = new URLSearchParams({
+      // `targets` drives the run; ca/agent stay for the first agent so a hand-written
+      // single-agent link still works.
+      targets: JSON.stringify(targets),
       ca: String(first.customerAgentId),
       agent: String(first.agentId),
       customer: first.customer,
       agentName: first.agentName,
     });
-    // Parallel execution lands in the next step; for now the first selection runs.
-    if (chosen.length > 1) params.set("queued", String(chosen.length));
     router.push(`/dashboard?${params.toString()}`);
   };
 
@@ -212,8 +225,8 @@ export default function ExistingAgent() {
 
           {selected.length > 1 && (
             <p className="mt-4 text-xs text-[#9CA3AF]">
-              Multiple combinations selected — the first one runs now. Running them together
-              arrives with parallel execution.
+              {selected.length} agents selected — they are tested in parallel, each with its own
+              test cases and its own reliability score.
             </p>
           )}
 

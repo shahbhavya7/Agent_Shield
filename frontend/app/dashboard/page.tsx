@@ -42,20 +42,24 @@ import {
   Save,
 } from "lucide-react";
 import {
-  createRun,
+  createRunGroup,
   discoverAgent,
   generateScenarios,
-  getReport,
-  getRun,
+  getGroupReport,
+  getRunGroup,
   getDemoReport,
   getStoredTestCases,
   saveTestCases,
   generateOneScenario,
   probeAgent,
   registerAgent,
+  saveAgentKnowledge,
+  type AgentReport,
+  type GroupRun,
   type Message,
   type Report,
   type RunCounts,
+  type RunTargetInput,
   type TestCase,
   type Trace,
 } from "../lib/api";
@@ -79,6 +83,10 @@ const TEST_CATEGORIES = [
 
 // Test types used when an existing combination has no stored suite and we generate one.
 const defaultTypes = TEST_CATEGORIES.filter((c) => c.type !== "system_failure").map((c) => c.type);
+
+// How much of an uploaded doc we keep. Matches MAX_KNOWLEDGE_CHARS in
+// backend/app/core/scenarios.py, so nothing is dropped silently on the way to the model.
+const MAX_KNOWLEDGE_CHARS = 60000;
 
 const VERIFICATION_STEPS = [
   "Registering agent…",
@@ -110,14 +118,14 @@ const shapes = [
 
 type Step = "connect" | "verifying" | "configure" | "review" | "running" | "results";
 
-// Set when arriving from Existing Agent Testing: which customer-agent combination is being
-// tested. Everything downstream keys off customerAgentId, never the agent name alone.
-type CustomerAgent = {
-  customerAgentId: number;
+// One agent selected for this test. Arriving from Existing Agent Testing there is one
+// per checked combination — they are crash-tested in parallel, each with its own suite.
+// Everything downstream keys off customerAgentId, never the agent name alone.
+type Target = {
+  customerAgentId: number | null;
   agentId: number;
   customer: string;
   agentName: string;
-  queued: number;
 };
 
 // A test case in the review stage: the backend scenario shape + local review metadata.
@@ -281,7 +289,7 @@ export default function DashboardPage() {
     if (!file) return;
     try {
       const text = await file.text();
-      setKnowledgeText(text.slice(0, 20000));
+      setKnowledgeText(text.slice(0, MAX_KNOWLEDGE_CHARS));
       setKnowledgeFile(file.name);
     } catch {
       setError("Couldn't read that file — please use a text/markdown file.");
@@ -295,16 +303,23 @@ export default function DashboardPage() {
   );
   const [guidance, setGuidance] = useState("");
 
-  const [context, setContext] = useState<CustomerAgent | null>(null);
+  // Every agent being tested this run. Empty on the "connect a new agent" path, which
+  // has exactly one agent and no customer context.
+  const [targets, setTargets] = useState<Target[]>([]);
+  // Which agent is on screen — indexes into `targets`/`suites` while reviewing, and into
+  // `reports` while looking at results.
+  const [activeIdx, setActiveIdx] = useState(0);
   const [agentId, setAgentId] = useState<number | null>(null);
-  const [runId, setRunId] = useState<number | null>(null);
-  const [counts, setCounts] = useState<RunCounts | null>(null);
+  // A group is the batch of runs launched together: one run per selected agent.
+  const [groupId, setGroupId] = useState<number | null>(null);
+  const [groupRuns, setGroupRuns] = useState<GroupRun[]>([]);
+  const [reports, setReports] = useState<AgentReport[]>([]);
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tickLabel, setTickLabel] = useState(0);
 
-  // --- review stage: the finalized test suite the user controls ---
-  const [testCases, setTestCases] = useState<ReviewCase[]>([]);
+  // --- review stage: one finalized suite per agent, parallel to `targets` ---
+  const [suites, setSuites] = useState<ReviewCase[][]>([[]]);
   const [generating, setGenerating] = useState(false);
   const [starting, setStarting] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -321,9 +336,59 @@ export default function DashboardPage() {
   // when the user just navigates back and forth without changing anything.
   const [suiteConfig, setSuiteConfig] = useState("");
 
+  // The agent whose suite is on screen, and that suite. `setTestCases` writes back into
+  // the active slot, so every existing review-stage edit keeps working unchanged.
+  const context = targets[activeIdx] ?? null;
+  const testCases = suites[activeIdx] ?? [];
+  const setTestCases = (
+    next: ReviewCase[] | ((prev: ReviewCase[]) => ReviewCase[])
+  ) =>
+    setSuites((prev) => {
+      const copy = prev.length ? [...prev] : [[]];
+      const cur = copy[activeIdx] ?? [];
+      copy[activeIdx] =
+        typeof next === "function"
+          ? (next as (p: ReviewCase[]) => ReviewCase[])(cur)
+          : next;
+      return copy;
+    });
+
+  // Switch which agent is being reviewed. agentId follows, because generation and saving
+  // always act on the agent on screen.
+  const selectTarget = (i: number) => {
+    const t = targets[i];
+    if (!t) return;
+    setActiveIdx(i);
+    setAgentId(t.agentId);
+    setSavedNote(null);
+    setError(null);
+  };
+
+  const selectReport = (i: number) => {
+    if (!reports[i]) return;
+    setActiveIdx(i);
+    setReport(reports[i]);
+  };
+
+  // Progress across the whole batch, summed from every run in the group.
+  const counts = useMemo<RunCounts | null>(() => {
+    if (!groupRuns.length) return null;
+    return groupRuns.reduce(
+      (acc, r) => ({
+        scenarios: acc.scenarios + r.counts.scenarios,
+        conversations: acc.conversations + r.counts.conversations,
+        messages: acc.messages + r.counts.messages,
+        judged: acc.judged + r.counts.judged,
+      }),
+      { scenarios: 0, conversations: 0, messages: 0, judged: 0 }
+    );
+  }, [groupRuns]);
+
+  const plannedScenarios = suites.reduce((n, s) => n + s.length, 0);
+
   const canVerify = agentName.trim().length > 0 && endpointUrl.trim().length > 0;
   const canGenerate = selectedTests.length > 0 && !generating;
-  const canRunTest = testCases.length > 0 && !starting && !generating;
+  const canRunTest = plannedScenarios > 0 && !starting && !generating;
   const aiCount = testCases.filter((c) => c.source === "ai").length;
   const userCount = testCases.filter((c) => c.source === "user").length;
 
@@ -333,7 +398,8 @@ export default function DashboardPage() {
   // "Run New Test" sends the user back to the start choice (new agent vs existing agent).
   const handleReset = () => {
     router.push("/start");
-    setContext(null);
+    setTargets([]);
+    setActiveIdx(0);
     setStep("connect");
     setApiKey("");
     setKnowledgeText("");
@@ -344,11 +410,12 @@ export default function DashboardPage() {
     setGuidance("");
     setVerifyIndex(0);
     setAgentId(null);
-    setRunId(null);
-    setCounts(null);
+    setGroupId(null);
+    setGroupRuns([]);
+    setReports([]);
     setReport(null);
     setError(null);
-    setTestCases([]);
+    setSuites([[]]);
     setSuiteConfig("");
     setEditing(null);
     setGenerating(false);
@@ -357,43 +424,79 @@ export default function DashboardPage() {
     setSavedNote(null);
   };
 
-  // --- Existing Agent Testing entry: ?ca=<customer_agent_id>&agent=&customer=&agentName= ---
-  // Connect + Verify are already done for a registered agent, so we go straight to the
-  // shared Review Test Cases step with that combination's stored suite.
+  // --- Existing Agent Testing entry ---
+  // ?targets=<json list of {ca,agent,customer,agentName}> for one or many agents, or the
+  // older ?ca=&agent=&customer=&agentName= for a single one. Connect + Verify are already
+  // done for registered agents, so we go straight to Review Test Cases.
   useEffect(() => {
     const q = new URLSearchParams(window.location.search);
-    const ca = Number(q.get("ca"));
-    const aid = Number(q.get("agent"));
-    if (!ca || !aid) return;
+    let parsed: Target[] = [];
 
-    const ctx: CustomerAgent = {
-      customerAgentId: ca,
-      agentId: aid,
-      customer: q.get("customer") || "",
-      agentName: q.get("agentName") || "",
-      queued: Number(q.get("queued")) || 1,
-    };
-    setContext(ctx);
-    setAgentId(aid);
+    const raw = q.get("targets");
+    if (raw) {
+      try {
+        parsed = (
+          JSON.parse(raw) as { ca: number; agent: number; customer?: string; agentName?: string }[]
+        )
+          .filter((t) => t && t.ca && t.agent)
+          .map((t) => ({
+            customerAgentId: Number(t.ca),
+            agentId: Number(t.agent),
+            customer: t.customer || "",
+            agentName: t.agentName || `Agent ${t.agent}`,
+          }));
+      } catch {
+        parsed = [];
+      }
+    }
+    if (!parsed.length) {
+      const ca = Number(q.get("ca"));
+      const aid = Number(q.get("agent"));
+      if (ca && aid) {
+        parsed = [{
+          customerAgentId: ca,
+          agentId: aid,
+          customer: q.get("customer") || "",
+          agentName: q.get("agentName") || `Agent ${aid}`,
+        }];
+      }
+    }
+    if (!parsed.length) return;
+
+    setTargets(parsed);
+    setActiveIdx(0);
+    setAgentId(parsed[0].agentId);
+    setSuites(parsed.map(() => []));
     setStep("review");
     setGenerating(true);
 
     (async () => {
-      try {
-        const stored = await getStoredTestCases(ca);
-        let scenarios = stored.scenarios;
-        // Nothing stored yet → generate now rather than showing an empty review page.
-        if (!scenarios.length) {
-          scenarios = (await generateScenarios(aid, defaultTypes, "", "")).scenarios;
-        }
-        setTestCases(
-          scenarios.map((sc) => ({ ...sc, uid: nextUid(), source: sc.source || "ai" }))
-        );
-      } catch (e) {
-        setError(`Couldn't load test cases: ${(e as Error).message}`);
-      } finally {
-        setGenerating(false);
+      // The agents are independent, so their suites load in parallel — and one agent
+      // failing to load must not blank out the others.
+      const failed: string[] = [];
+      const loaded = await Promise.all(
+        parsed.map(async (t) => {
+          try {
+            const stored = await getStoredTestCases(t.customerAgentId as number);
+            let scenarios = stored.scenarios;
+            // Nothing stored yet → generate now rather than showing an empty review page.
+            if (!scenarios.length) {
+              scenarios = (await generateScenarios(t.agentId, defaultTypes, "", "")).scenarios;
+            }
+            return scenarios.map((sc) => ({
+              ...sc, uid: nextUid(), source: sc.source || "ai",
+            })) as ReviewCase[];
+          } catch {
+            failed.push(t.agentName);
+            return [] as ReviewCase[];
+          }
+        })
+      );
+      setSuites(loaded);
+      if (failed.length) {
+        setError(`Couldn't load test cases for ${failed.join(", ")} — add or generate them below.`);
       }
+      setGenerating(false);
     })();
   }, []);
 
@@ -415,6 +518,14 @@ export default function DashboardPage() {
         description: aboutText.trim() || undefined,
       });
       setAgentId(agent_id);
+      // Store the uploaded docs on the agent so every later run stays grounded on them.
+      if (knowledgeText.trim()) {
+        try {
+          await saveAgentKnowledge(agent_id, knowledgeText, knowledgeFile);
+        } catch {
+          /* non-fatal — this run still grounds on the in-memory copy */
+        }
+      }
       setVerifyIndex(2);
       await sleep(300);
       setVerifyIndex(3);
@@ -507,23 +618,44 @@ export default function DashboardPage() {
     }
   };
 
-  // --- Stage 3: save the reviewed suite, then execute exactly it, then poll ---
+  // --- Stage 3: save every reviewed suite, then execute all of them in parallel ---
   const handleRunTest = async () => {
     if (!canRunTest || !agentId) return;
     setError(null);
     setSavedNote(null);
     setStarting(true);
-    const suite: TestCase[] = suitePayload();
+
+    // One target per selected agent, each carrying its own reviewed suite. An agent with
+    // an empty suite is left out rather than launched with nothing to run.
+    const batch: RunTargetInput[] = (
+      targets.length
+        ? targets.map((t, i) => ({
+            agent_id: t.agentId,
+            customer_agent_id: t.customerAgentId,
+            scenarios: suitePayload(suites[i] ?? []),
+          }))
+        : [{ agent_id: agentId, customer_agent_id: null, scenarios: suitePayload() }]
+    ).filter((t) => t.scenarios.length > 0);
+
+    if (!batch.length) {
+      setError("None of the selected agents have any test cases yet.");
+      setStarting(false);
+      return;
+    }
+
     try {
       setSaving(true);
-      await saveTestCases(agentId, suite, context?.customerAgentId ?? null);
-      setSaving(false);
-      const { run_id } = await createRun(
-        agentId, selectedTypes(), guidance, knowledgeText, suite,
-        context?.customerAgentId ?? null
+      // Persist each suite so the stored copy matches exactly what is about to run.
+      await Promise.all(
+        batch.map((t) => saveTestCases(t.agent_id, t.scenarios, t.customer_agent_id))
       );
-      setRunId(run_id);
-      setCounts(null);
+      setSaving(false);
+      const { group_id } = await createRunGroup(
+        batch, selectedTypes(), guidance, knowledgeText
+      );
+      setGroupId(group_id);
+      setGroupRuns([]);
+      setReports([]);
       setReport(null);
       setStep("running");
     } catch (e) {
@@ -582,25 +714,29 @@ export default function DashboardPage() {
   };
 
   useEffect(() => {
-    if (step !== "running" || !runId) return;
+    if (step !== "running" || !groupId) return;
     let alive = true;
     const poll = async () => {
       try {
-        const r = await getRun(runId);
+        const g = await getRunGroup(groupId);
         if (!alive) return;
-        setCounts(r.counts);
-        if (r.status === "done") {
-          const rep = await getReport(runId);
+        setGroupRuns(g.runs);
+        // The group reports done once no agent is still in flight. An agent that errored
+        // is finished too — its partial results still show, the others are unaffected.
+        if (g.status === "done") {
+          const { reports: reps } = await getGroupReport(groupId);
           if (!alive) return;
-          setReport(rep);
+          setReports(reps);
+          setActiveIdx(0);
+          setReport(reps[0] ?? null);
+          if (g.errored) {
+            setError(
+              g.errored === g.total
+                ? "Every run errored — showing partial results."
+                : `${g.errored} of ${g.total} agents errored — those results are partial.`
+            );
+          }
           setTimeout(() => alive && setStep("results"), 600);
-          return;
-        }
-        if (r.status === "error") {
-          setError("The run errored — showing partial results.");
-          const rep = await getReport(runId).catch(() => null);
-          if (rep) setReport(rep);
-          setStep("results");
           return;
         }
       } catch {
@@ -612,7 +748,7 @@ export default function DashboardPage() {
     return () => {
       alive = false;
     };
-  }, [step, runId]);
+  }, [step, groupId]);
 
   // Rotate the "currently testing" label while running.
   useEffect(() => {
@@ -640,7 +776,7 @@ export default function DashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const totalScenarios = counts?.scenarios || testCases.length || 8;
+  const totalScenarios = counts?.scenarios || plannedScenarios || 8;
   const progressPercent = counts
     ? Math.min(100, Math.round(((counts.conversations + counts.judged) / (Math.max(totalScenarios, 1) * 2)) * 100))
     : 4;
@@ -1024,9 +1160,9 @@ export default function DashboardPage() {
                           <span className="rounded-full border border-white/12 bg-white/2 px-3 py-1 text-[#9CA3AF]">
                             {context.agentName}
                           </span>
-                          {context.queued > 1 && (
+                          {targets.length > 1 && (
                             <span className="text-slate-500">
-                              (1 of {context.queued} selected — parallel execution comes next)
+                              ({targets.length} agents run in parallel · {plannedScenarios} test cases total)
                             </span>
                           )}
                         </p>
@@ -1040,6 +1176,30 @@ export default function DashboardPage() {
                       ← Back to Configure
                     </button>
                   </div>
+
+                  {/* One tab per selected agent — each owns its own test-case suite. */}
+                  {targets.length > 1 && (
+                    <div className="mt-6 flex flex-wrap items-center gap-2 border-b border-white/10 pb-4">
+                      {targets.map((t, i) => (
+                        <button
+                          key={`${t.customerAgentId}-${t.agentId}-${i}`}
+                          onClick={() => selectTarget(i)}
+                          disabled={starting}
+                          className={`flex items-center gap-2 rounded-full border px-3.5 py-1.5 text-xs font-medium transition-all disabled:cursor-not-allowed ${
+                            i === activeIdx
+                              ? "border-white/40 bg-white/12 text-[#F8FAFC]"
+                              : "border-white/12 bg-white/2 text-[#9CA3AF] hover:border-white/25 hover:text-[#F8FAFC]"
+                          }`}
+                        >
+                          <Bot className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          <span className="max-w-[14rem] truncate">{t.agentName}</span>
+                          <span className="rounded-full bg-white/10 px-1.5 py-0.5 text-[10px] tabular-nums text-slate-300">
+                            {(suites[i] ?? []).length}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
 
                   {generating && testCases.length === 0 ? (
                     <div className="mt-8 flex flex-col items-center gap-3 rounded-lg border border-white/8 bg-white/1 py-14 text-center">
@@ -1150,8 +1310,16 @@ export default function DashboardPage() {
 
                   <div className="mt-8 border-t border-white/10 pt-6">
                     <p className="text-center text-sm font-medium text-[#F8FAFC]">
-                      Final test suite: {testCases.length} test case{testCases.length === 1 ? "" : "s"}
+                      {targets.length > 1
+                        ? `Final suites: ${plannedScenarios} test case${plannedScenarios === 1 ? "" : "s"} across ${targets.length} agents`
+                        : `Final test suite: ${testCases.length} test case${testCases.length === 1 ? "" : "s"}`}
                     </p>
+                    {targets.length > 1 && (
+                      <p className="mt-1 text-center text-xs text-slate-500">
+                        {testCases.length} of them belong to {context?.agentName || "this agent"} — Save
+                        stores this agent&apos;s suite, Run tests every selected agent.
+                      </p>
+                    )}
                     <div className="mt-4 flex flex-col gap-3 sm:flex-row">
                       <button
                         onClick={handleSaveTestCases}
@@ -1170,7 +1338,13 @@ export default function DashboardPage() {
                         className="flex flex-1 items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-6 py-3 text-sm font-medium text-[#F8FAFC] transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:shadow-none"
                       >
                         {starting ? <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.5} /> : <PlayCircle className="h-4 w-4" strokeWidth={1.5} />}
-                        {starting ? (saving ? "Saving test cases…" : "Starting run…") : "Run Reliability Test"}
+                        {starting
+                          ? saving
+                            ? "Saving test cases…"
+                            : "Starting runs…"
+                          : targets.length > 1
+                            ? `Run ${targets.length} Agents in Parallel`
+                            : "Run Reliability Test"}
                       </motion.button>
                     </div>
                     {savedNote && (
@@ -1178,9 +1352,15 @@ export default function DashboardPage() {
                         {savedNote}
                       </p>
                     )}
-                    {testCases.length === 0 && (
+                    {plannedScenarios === 0 && (
                       <p className="mt-3 text-center text-xs text-[#FBBF24]">
                         Add or regenerate at least one test case before running the reliability test.
+                      </p>
+                    )}
+                    {plannedScenarios > 0 && testCases.length === 0 && (
+                      <p className="mt-3 text-center text-xs text-[#FBBF24]">
+                        {context?.agentName || "This agent"} has no test cases — it will be skipped
+                        unless you add one.
                       </p>
                     )}
                   </div>
@@ -1192,7 +1372,11 @@ export default function DashboardPage() {
           {step === "running" && (
             <motion.section key="running" {...fadeStep} className="mt-10 flex justify-center">
               <div className="w-full max-w-2xl rounded-xl border border-white/12 bg-white/2 p-10 text-center backdrop-blur-md">
-                <h2 className="font-heading text-2xl font-medium text-[#F8FAFC]">Running Tests…</h2>
+                <h2 className="font-heading text-2xl font-medium text-[#F8FAFC]">
+                  {Math.max(groupRuns.length, targets.length) > 1
+                    ? `Testing ${Math.max(groupRuns.length, targets.length)} Agents in Parallel…`
+                    : "Running Tests…"}
+                </h2>
                 <p className="mt-2 text-sm text-[#9CA3AF]">
                   {counts ? `${counts.judged} / ${totalScenarios} scenarios judged · ${counts.conversations} conversations` : "Generating adversarial scenarios…"}
                 </p>
@@ -1200,6 +1384,39 @@ export default function DashboardPage() {
                 <div className="mt-6 h-3 w-full overflow-hidden rounded-full bg-white/6">
                   <motion.div className="h-full rounded-full bg-linear-to-r from-[#E5E7EB] to-[#94A3B8]" animate={{ width: `${progressPercent}%` }} transition={{ duration: 0.4, ease: "linear" }} />
                 </div>
+
+                {/* Per-agent progress: the agents advance independently, so each shows
+                    its own state rather than a single shared spinner. */}
+                {groupRuns.length > 1 && (
+                  <div className="mt-8 flex flex-col gap-2 text-left">
+                    {groupRuns.map((r) => (
+                      <div
+                        key={r.run_id}
+                        className="flex items-center gap-3 rounded-lg border border-white/8 bg-white/1 px-4 py-3"
+                      >
+                        {r.status === "done" ? (
+                          <CheckCircle2 className="h-4 w-4 shrink-0 text-[#34D399]" strokeWidth={1.5} />
+                        ) : r.status === "error" ? (
+                          <AlertTriangle className="h-4 w-4 shrink-0 text-[#F87171]" strokeWidth={1.5} />
+                        ) : r.status === "running" ? (
+                          <Loader2 className="h-4 w-4 shrink-0 animate-spin text-slate-300" />
+                        ) : (
+                          <Circle className="h-4 w-4 shrink-0 text-slate-600" strokeWidth={1.5} />
+                        )}
+                        <span className="min-w-0 truncate text-sm font-medium text-[#F8FAFC]">
+                          {r.agent_name || `Agent ${r.agent_id}`}
+                        </span>
+                        <span className="ml-auto shrink-0 text-xs tabular-nums text-slate-400">
+                          {r.status === "done" && r.reliability_score !== null
+                            ? `${Math.round(r.reliability_score)} / 100`
+                            : r.status === "error"
+                              ? "errored"
+                              : `${r.counts.judged} / ${r.counts.scenarios || "…"} judged`}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 <div className="mt-8 flex items-center gap-3 rounded-lg border border-white/8 bg-white/1 px-6 py-4 text-left">
                   <Loader2 className="h-5 w-5 shrink-0 animate-spin text-slate-300" />
@@ -1227,6 +1444,48 @@ export default function DashboardPage() {
               {report.is_demo && (
                 <div className="mt-6 rounded-lg border border-[#FBBF24]/30 bg-[#FBBF24]/10 px-4 py-2 text-center text-sm text-[#FBBF24]">
                   ✦ Sample report — pre-baked demo data (works offline)
+                </div>
+              )}
+
+              {/* One report per agent tested. Each tab carries its score, so the batch
+                  compares at a glance and the detail below follows the selection. */}
+              {reports.length > 1 && (
+                <div className="mt-6 rounded-xl border border-white/12 bg-white/2 p-5 backdrop-blur-md">
+                  <p className="text-xs font-medium text-[#9CA3AF]">
+                    {reports.length} agents tested in parallel — select one to see its report
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {reports.map((r, i) => {
+                      const score = r.reliability_score ?? 0;
+                      const tone =
+                        r.run.status === "error"
+                          ? "text-[#F87171]"
+                          : score >= 75
+                            ? "text-[#34D399]"
+                            : score >= 50
+                              ? "text-[#FBBF24]"
+                              : "text-[#F87171]";
+                      return (
+                        <button
+                          key={r.run.id}
+                          onClick={() => selectReport(i)}
+                          className={`flex items-center gap-2.5 rounded-full border px-4 py-2 text-xs font-medium transition-all ${
+                            i === activeIdx
+                              ? "border-white/40 bg-white/12 text-[#F8FAFC]"
+                              : "border-white/12 bg-white/2 text-[#9CA3AF] hover:border-white/25 hover:text-[#F8FAFC]"
+                          }`}
+                        >
+                          <Bot className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          <span className="max-w-[14rem] truncate">
+                            {r.agent_name || `Agent ${r.agent_id}`}
+                          </span>
+                          <span className={`tabular-nums ${tone}`}>
+                            {r.run.status === "error" ? "error" : Math.round(score)}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
 

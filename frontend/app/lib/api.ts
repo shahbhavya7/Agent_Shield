@@ -104,12 +104,55 @@ export interface Breakdown {
   performance?: Performance;
 }
 
+// ---- parallel runs: one group holds one run per selected agent ----
+
+// One agent to crash-test in a batch, with its own reviewed suite. Suites belong to a
+// customer-agent combination, so every target carries its own.
+export interface RunTargetInput {
+  agent_id: number;
+  customer_agent_id: number | null;
+  scenarios: TestCase[];
+}
+
+export interface GroupRun {
+  run_id: number;
+  agent_id: number;
+  agent_name: string | null;
+  customer_name: string | null;
+  customer_agent_id: number | null;
+  status: "queued" | "running" | "done" | "error";
+  reliability_score: number | null;
+  counts: RunCounts;
+}
+
+export interface RunGroupStatus {
+  group_id: number;
+  status: "running" | "done";
+  total: number;
+  finished: number;
+  errored: number;
+  runs: GroupRun[];
+}
+
 export interface Report {
   run: { id: number | string; status: string };
   reliability_score: number | null;
   breakdown: Breakdown | null;
   conversations: Conversation[];
   is_demo?: boolean;
+}
+
+// A group report is one Report per agent, each labelled with whose agent it is.
+export type AgentReport = Report & {
+  agent_id: number;
+  agent_name: string | null;
+  customer_name: string | null;
+  customer_agent_id: number | null;
+};
+
+export interface GroupReport {
+  group_id: number;
+  reports: AgentReport[];
 }
 
 // One customer and the agents onboarded for them (backend/inventory.yaml).
@@ -149,6 +192,18 @@ export function discoverAgent(agentId: number): Promise<{ description: string }>
   return req(`/agents/${agentId}/discover`, { method: "POST" });
 }
 
+// Attach the agent's docs so every later run for it generates grounded test cases.
+export function saveAgentKnowledge(
+  agentId: number,
+  text: string,
+  name: string
+): Promise<{ agent_id: number; knowledge_name: string | null; chars: number }> {
+  return req(`/agents/${agentId}/knowledge`, {
+    method: "POST",
+    body: JSON.stringify({ text, name }),
+  });
+}
+
 // Stage 1 — generate the test suite for review. Runs nothing.
 export function generateScenarios(
   agentId: number,
@@ -179,6 +234,28 @@ export function createRun(
       customer_agent_id: customerAgentId,
     }),
   });
+}
+
+// Execute every selected agent in parallel. One run per agent, one group over them —
+// each agent keeps its own scenarios, verdicts and reliability score.
+export function createRunGroup(
+  targets: RunTargetInput[],
+  tests: string[],
+  guidance = "",
+  knowledge = ""
+): Promise<{ group_id: number; runs: { run_id: number; agent_id: number; customer_agent_id: number | null }[] }> {
+  return req("/runs/group", {
+    method: "POST",
+    body: JSON.stringify({ targets, tests, guidance, knowledge }),
+  });
+}
+
+export function getRunGroup(groupId: number): Promise<RunGroupStatus> {
+  return req(`/runs/group/${groupId}`);
+}
+
+export function getGroupReport(groupId: number): Promise<GroupReport> {
+  return req(`/runs/group/${groupId}/report`);
 }
 
 export function getRun(runId: number): Promise<RunStatus> {

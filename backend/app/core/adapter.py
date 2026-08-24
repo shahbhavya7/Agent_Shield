@@ -17,6 +17,7 @@ from app.db import (
     get_or_create_customer,
     get_or_create_customer_agent,
     insert_agent,
+    update_agent_description,
 )
 
 # The standard request template for our sample RAG agent. Placeholders:
@@ -24,6 +25,27 @@ from app.db import (
 #   {history} -> JSON array          (no quotes)
 #   {faults}  -> JSON array          (no quotes)
 DEFAULT_REQUEST_TEMPLATE = '{"message":"{message}","history":{history},"faults":{faults}}'
+
+# Domain descriptions for the agents in inventory.yaml. This is the ONLY thing the scenario
+# generator knows about an agent when no docs are uploaded, so a placeholder here means test
+# cases get invented from general knowledge instead of the agent's actual domain.
+SAMPLE_AGENT_DESCRIPTIONS: dict[str, str] = {
+    "banking_bot": (
+        "NorthBank's retail banking support assistant. Answers customer questions about "
+        "wire/ACH transfer limits, overdraft fees, card replacement, fraud reporting, loan "
+        "rates, mobile deposits, statements, and support hours."
+    ),
+    "hr_bot": (
+        "PeopleDesk, an internal HR assistant for employees. Answers questions about paid "
+        "time off, sick and parental leave, the 401(k) match, payroll schedule, remote-work "
+        "policy, expense reimbursement, and benefits enrollment."
+    ),
+    "insurance_bot": (
+        "SafeGuard's auto and home insurance claims assistant. Answers policyholder questions "
+        "about claim filing windows, deductibles, claim processing times, roadside assistance, "
+        "glass repair, rental car coverage, premium grace periods, and total-loss valuation."
+    ),
+}
 # Internal identifier of the sample RAG agent — matches its /health "service" value and
 # its key in mapping.yaml.
 SAMPLE_RAG_BOT_KEY = "sample_rag_bot"
@@ -175,13 +197,17 @@ def seed_inventory() -> int:
         for key in customer["agents"]:
             name = agent_display_name(key)
             agent = get_agent_by_name(name)
+            if agent and key in SAMPLE_AGENT_DESCRIPTIONS:
+                # Seeding matches on name, so an already-seeded row keeps whatever
+                # description it was created with — refresh it from the map.
+                update_agent_description(agent["id"], SAMPLE_AGENT_DESCRIPTIONS[key])
             agent_id = agent["id"] if agent else insert_agent(
                 name=name,
                 kind="sample",
                 endpoint_url=SAMPLE_AGENT_URLS.get(key, ""),
                 response_path="reply",
                 request_template=DEFAULT_REQUEST_TEMPLATE,
-                description=f"Sample agent '{key}' from backend/sample_agents/.",
+                description=SAMPLE_AGENT_DESCRIPTIONS.get(key, f"Sample agent '{key}'."),
             )
             get_or_create_customer_agent(customer_id, agent_id)
             pairs += 1
