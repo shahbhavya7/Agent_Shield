@@ -136,6 +136,22 @@ def init_schema() -> None:
         -- run for this agent stays grounded without re-uploading the file.
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge TEXT;
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge_name TEXT;
+
+        -- Idempotency, so a re-executed unit of work converges on the same rows instead
+        -- of appending new ones. This is the precondition for turning on retries.
+        --
+        -- conversations.idem_key: a caller-supplied natural key for "this scenario, in
+        -- this run". PostgreSQL treats NULLs as distinct in a unique index, so every
+        -- pre-existing row — and every replay, which deliberately wants a NEW
+        -- conversation — keeps a NULL key and is unaffected.
+        ALTER TABLE conversations ADD COLUMN IF NOT EXISTS idem_key TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS conversations_idem_key_uq
+            ON conversations (idem_key);
+
+        -- One row per turn. Guards against a genuinely concurrent double-execution,
+        -- which clear_messages() alone cannot prevent.
+        CREATE UNIQUE INDEX IF NOT EXISTS messages_conv_turn_uq
+            ON messages (conversation_id, turn_index);
         """
     )
     conn.commit()
@@ -320,6 +336,38 @@ def insert_scenario(run_id: int, s: dict) -> int:
     return sid
 
 
+def replace_scenarios(run_id: int, scenarios: list[dict]) -> list[int]:
+    """Make `scenarios` the run's scenario set. Returns the new ids, in input order.
+
+    Safe to call twice: the run's existing scenarios are removed first, so a re-executed
+    persist step converges instead of duplicating the whole suite. Scenario titles are
+    LLM-generated and do collide within a single run, so there is no usable natural key
+    here — replacing the set is what makes this idempotent.
+
+    Must run BEFORE any conversation exists for the run (it does: scenarios are persisted
+    in stage 3, conversations are created in stage 4). If that order is ever broken the
+    delete hits the conversations foreign key and fails loudly — far better than silently
+    duplicating a suite.
+    """
+    conn = get_conn()
+    conn.execute("DELETE FROM scenarios WHERE run_id = %s", (run_id,))
+    ids: list[int] = []
+    for s in scenarios:
+        cur = conn.execute(
+            """INSERT INTO scenarios
+               (run_id, title, user_goal, test_type, assigned_fault,
+                expected_behavior, seed_turns_json)
+               VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (run_id, s.get("title"), s.get("user_goal"), s.get("test_type"),
+             s.get("assigned_fault"), s.get("expected_behavior"),
+             _json.dumps(s.get("seed_turns", []))),
+        )
+        ids.append(cur.fetchone()["id"])
+    conn.commit()
+    conn.close()
+    return ids
+
+
 def insert_conversation(run_id: int, scenario_id: int) -> int:
     conn = get_conn()
     cur = conn.execute(
@@ -330,6 +378,49 @@ def insert_conversation(run_id: int, scenario_id: int) -> int:
     conn.commit()
     conn.close()
     return cid
+
+
+def get_or_create_conversation(
+    run_id: int, scenario_id: int, idem_key: str | None = None
+) -> int:
+    """Conversation id for this scenario, creating it only the first time.
+
+    The same `idem_key` always resolves to the same row, so a re-executed scenario
+    reuses its conversation instead of leaving an orphan behind. Pass `idem_key=None`
+    (the default) when a NEW conversation is genuinely wanted — that is what replay
+    does — in which case this is just `insert_conversation`.
+    """
+    if idem_key is None:
+        return insert_conversation(run_id, scenario_id)
+
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO conversations (run_id, scenario_id, idem_key)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (idem_key) DO UPDATE SET run_id = EXCLUDED.run_id
+           RETURNING id""",
+        (run_id, scenario_id, idem_key),
+    )
+    cid = cur.fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return cid
+
+
+def clear_messages(conversation_id: int) -> int:
+    """Drop a conversation's transcript so a re-executed scenario writes a clean one.
+
+    A retry restarts turn numbering at 0, but the transcript can legitimately diverge
+    mid-way (the adaptive follow-up is LLM-generated), so overwriting turn by turn could
+    strand tail turns from a longer earlier attempt. Clearing first avoids that.
+    """
+    conn = get_conn()
+    n = conn.execute(
+        "DELETE FROM messages WHERE conversation_id = %s", (conversation_id,)
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return n
 
 
 def insert_message(

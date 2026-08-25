@@ -5,7 +5,8 @@ import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.core.orchestrator import prepare_scenarios, start_run_group
+from app.core.activities import prepare_scenarios
+from app.core.orchestrator import start_run_group
 from app.core.scenarios import normalize_scenarios
 from app.db import (
     build_conversation_payload,

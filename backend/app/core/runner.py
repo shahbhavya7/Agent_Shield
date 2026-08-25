@@ -8,7 +8,7 @@ from typing import Any
 
 from app.core.adapter import send
 from app.core.llm import chat
-from app.db import insert_conversation, insert_message
+from app.db import clear_messages, get_or_create_conversation, insert_message
 
 MAX_TESTER_TURNS = 5
 ADAPTIVE_TYPES = {"injection", "memory", "contradiction"}
@@ -55,10 +55,21 @@ async def _adaptive_followup(scenario: dict, transcript: list[dict]) -> str | No
         }.get(scenario["test_type"])
 
 
-async def run_scenario(run_id: int, scenario: dict, agent: Any) -> int:
-    """Play a scenario end-to-end. Returns the (unjudged) conversation id."""
+async def run_scenario(
+    run_id: int, scenario: dict, agent: Any, idem_key: str | None = None
+) -> int:
+    """Play a scenario end-to-end. Returns the (unjudged) conversation id.
+
+    Pass `idem_key` to make the whole call safely re-executable: the same key always
+    resolves to the same conversation, and its transcript is cleared first, so running
+    this twice leaves exactly one conversation with one clean set of turns. Omit it
+    (the default) when a NEW conversation is wanted — replay does that.
+    """
     scenario_id = scenario["_id"]
-    conv_id = insert_conversation(run_id, scenario_id)
+    conv_id = get_or_create_conversation(run_id, scenario_id, idem_key)
+    # Reused conversation from an earlier attempt: drop its turns so this attempt writes
+    # a clean transcript rather than appending to a partial one.
+    clear_messages(conv_id)
 
     assigned_fault = scenario.get("assigned_fault", "none")
     faults = [] if assigned_fault in (None, "none") else [assigned_fault]
