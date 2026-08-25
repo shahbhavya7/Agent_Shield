@@ -16,17 +16,23 @@ router = APIRouter(prefix="/inventory", tags=["inventory"])
 
 @router.get("")
 def get_inventory() -> dict:
-    """Customers with their onboarded agents (internal key, display name, and DB ids)."""
-    # (customer name, agent name) -> the customer_agents row.
-    combos = {(c["customer_name"], c["agent_name"]): c for c in list_customer_agents()}
+    """Customers with their onboarded agents (internal key, display name, and DB ids).
+
+    Seeded customer-agent pairs come from inventory.yaml. Agents connected through
+    "Connect Your AI Agent" are appended from PostgreSQL so saved test cases stay
+    reachable after a reload.
+    """
+    all_combos = list_customer_agents()
+    combos = {(c["customer_name"], c["agent_name"]): c for c in all_combos}
     customers = []
-    seeded: set[tuple[str, str]] = set()
+    emitted_combo_ids: set[int] = set()
     for c in INVENTORY:
         agents = []
         for key in c["agents"]:
             name = agent_display_name(key)
             combo = combos.get((c["name"], name))
-            seeded.add((c["name"], name))
+            if combo:
+                emitted_combo_ids.add(combo["id"])
             agents.append({
                 "key": key,
                 "name": name,
@@ -39,16 +45,15 @@ def get_inventory() -> dict:
     # no inventory.yaml entry — so append every combination the seeded loop didn't emit.
     # Their display name is the agents.name column, so mapping.yaml needs no entry either.
     dynamic: dict[str, list[dict]] = {}
-    for (customer_name, agent_name), combo in combos.items():
-        if (customer_name, agent_name) in seeded:
+    for combo in all_combos:
+        if combo["id"] in emitted_combo_ids:
             continue
-        dynamic.setdefault(customer_name, []).append({
-            "key": f"agent-{combo['agent_id']}",
-            "name": agent_name,
+        dynamic.setdefault(combo["customer_name"], []).append({
+            "key": f"customer-agent-{combo['id']}",
+            "name": combo["agent_name"],
             "customer_agent_id": combo["id"],
             "agent_id": combo["agent_id"],
         })
-    # dict order follows list_customer_agents()' ORDER BY, i.e. the order they were created.
     customers.extend({"name": name, "agents": agents} for name, agents in dynamic.items())
     return {"customers": customers}
 
