@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # AgentShield — start everything with one command.
 #   ./run_all.sh
-# Starts: backend (8000), 4 sample agents (8002-8005), and the frontend (3000).
-# Ctrl-C stops them all.
+# Starts: local Postgres (Docker), backend (8000), 4 sample agents (8002-8005),
+# and the frontend (3000).
+# Ctrl-C stops the app processes (the DB container keeps running — see cleanup()).
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BE="$ROOT/backend"
 FE="$ROOT/frontend"
 PY="$BE/.venv/bin/uvicorn"
+COMPOSE="$BE/docker-compose.local.yml"
 export PATH="/opt/homebrew/bin:$PATH"   # ensure node/npm are found (Homebrew)
 
 pids=()
@@ -17,6 +19,8 @@ cleanup() {
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
   # free the ports in case anything lingers
   for p in 8000 8002 8003 8004 8005 3000; do lsof -ti:$p | xargs kill 2>/dev/null; done
+  # Postgres container is left running (cheap, other tools may want it too) —
+  # stop it yourself with: docker compose -f backend/docker-compose.local.yml down
   exit 0
 }
 trap cleanup INT TERM
@@ -28,6 +32,16 @@ if [ ! -x "$PY" ]; then
 fi
 if [ ! -f "$BE/.env" ]; then
   echo "WARNING: $BE/.env missing — copy .env.example to .env and paste your OPENAI_API_KEY."
+fi
+
+if [ -f "$COMPOSE" ]; then
+  echo "Starting local Postgres (Docker)…"
+  docker compose -f "$COMPOSE" up -d
+  echo "  → waiting for Postgres to be ready…"
+  for i in $(seq 1 30); do
+    docker exec agentshield-db pg_isready -U agentshield >/dev/null 2>&1 && break
+    sleep 1
+  done
 fi
 
 start_agent() { # name module port

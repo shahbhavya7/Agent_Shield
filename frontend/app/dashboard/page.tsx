@@ -609,7 +609,34 @@ export default function DashboardPage() {
     setSavedNote(null);
     setSaving(true);
     try {
-      const { saved } = await saveTestCases(agentId, suitePayload(), context?.customerAgentId ?? null);
+      const { saved, customer_agent_id } = await saveTestCases(
+        agentId,
+        suitePayload(),
+        context?.customerAgentId ?? null
+      );
+      // The backend may hand back a customer_agent_id we didn't have yet (an agent
+      // connected ad-hoc gets filed under a reserved "Unassigned" customer the first
+      // time it's saved). Remember it — in `targets` and in the URL — so this same
+      // agent's saved test cases are still reachable after a reload, instead of only
+      // living in a DB row nothing on screen points at.
+      if (!context || context.customerAgentId == null) {
+        setTargets((prev) => {
+          const next = prev.length ? [...prev] : [{
+            customerAgentId: null,
+            agentId,
+            customer: "",
+            agentName: agentName || `Agent ${agentId}`,
+          }];
+          next[activeIdx] = { ...next[activeIdx], customerAgentId: customer_agent_id };
+          return next;
+        });
+        const url = new URL(window.location.href);
+        url.searchParams.set(
+          "targets",
+          JSON.stringify([{ ca: customer_agent_id, agent: agentId, agentName }])
+        );
+        window.history.replaceState(null, "", url.toString());
+      }
       setSavedNote(`Saved — ${saved} test case${saved === 1 ? "" : "s"} stored for this agent.`);
     } catch (e) {
       setError(`Couldn't save test cases: ${(e as Error).message}`);
