@@ -21,6 +21,16 @@ DATABASE_URL: str = os.getenv(
 # Demo safety: cap scenarios per run so a live run finishes well under ~90s.
 MAX_SCENARIOS: int = int(os.getenv("MAX_SCENARIOS", "10"))
 
+# --- Temporal ----------------------------------------------------------------
+# Where the Temporal server is. `temporal server start-dev` listens on 7233 by default
+# and serves its Web UI on 8233. Nothing in the app requires Temporal yet — these only
+# take effect for the worker and for code that explicitly asks for a client.
+TEMPORAL_ADDRESS: str = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
+TEMPORAL_NAMESPACE: str = os.getenv("TEMPORAL_NAMESPACE", "default")
+# The queue a worker polls and a client targets. One queue for now; splitting it later
+# (e.g. cheap DB work vs. expensive LLM work) is a worker-config change, not a code one.
+TEMPORAL_TASK_QUEUE: str = os.getenv("TEMPORAL_TASK_QUEUE", "agentshield")
+
 # --- Concurrency -------------------------------------------------------------
 # How many selected agents are crash-tested at the same time. Each one is an
 # independent run, so this is the width of the parallel fan-out.

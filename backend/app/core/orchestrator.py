@@ -7,7 +7,9 @@ Three workflows live here:
   replay_conversation a single scenario re-played as a new conversation
 
 Every external call goes through `app.core.activities`; nothing in this module touches
-PostgreSQL, the LLM, or the agent under test directly. That separation is deliberate —
+PostgreSQL, the LLM, or the agent under test directly. The activities that are awaited
+are the genuinely-awaitable ones (LLM, agent HTTP); the plain calls are the synchronous
+database activities, which Temporal will run on a worker thread. That separation is deliberate —
 it is what lets these three functions become Temporal Workflows later without their
 control flow changing, and it keeps the decisions about *when* work runs (and what
 happens when it fails) in one readable place.
@@ -85,9 +87,9 @@ async def start_run(
     as-is and NO generation happens; when omitted, a suite is generated first.
     """
     try:
-        agent = await load_agent(agent_id)
+        agent = load_agent(agent_id)
         if agent is None:
-            await fail_run(run_id)
+            fail_run(run_id)
             return
 
         # 1) Use the reviewed suite if the client supplied one; otherwise generate.
@@ -98,7 +100,7 @@ async def start_run(
         )
 
         # 2) Persist the suite, carrying each row's id back onto its dict for the runner.
-        for scenario, scenario_id in zip(suite, await persist_suite(run_id, suite)):
+        for scenario, scenario_id in zip(suite, persist_suite(run_id, suite)):
             scenario["_id"] = scenario_id
 
         # 3) Play every scenario against the agent.
@@ -110,23 +112,23 @@ async def start_run(
 
         # 4) Judge every conversation that resulted.
         await _fan_out(
-            await list_conversation_ids(run_id),
+            list_conversation_ids(run_id),
             judge_conversation_by_id,
             lambda cid: f"judge for conv {cid}",
         )
 
         # 5) Explain + suggest fix — FAILURES ONLY (the pass/fail branch).
         await _fan_out(
-            await list_failed_conversation_ids(run_id),
+            list_failed_conversation_ids(run_id),
             explain_conversation_by_id,
             lambda cid: f"fix for conv {cid}",
         )
 
         # 6) Score + finalize.
-        await finalize_run(run_id)
+        finalize_run(run_id)
     except Exception as e:
         print(f"[orchestrator] run {run_id} errored: {e}")
-        await fail_run(run_id)
+        fail_run(run_id)
 
 
 async def start_run_group(
@@ -162,7 +164,7 @@ async def start_run_group(
                 # start_run already swallows its own failures; this is the last resort
                 # so one dead agent cannot leave the batch hanging in "running".
                 print(f"[orchestrator] run {run_id} in group crashed: {e}")
-                await fail_run(run_id)
+                fail_run(run_id)
 
     await asyncio.gather(*(_one(t) for t in targets))
 
@@ -174,7 +176,7 @@ async def replay_conversation(conversation_id: int) -> int | None:
     scenario. Deliberately unkeyed, so the original conversation is left intact for
     before/after comparison.
     """
-    ctx = await load_replay_context(conversation_id)
+    ctx = load_replay_context(conversation_id)
     if ctx is None:
         return None
 

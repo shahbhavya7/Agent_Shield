@@ -11,11 +11,25 @@ Every activity here is:
     work in app.db);
   * a single unit of work, so it can later carry its own timeout and retry policy.
 
-These are the functions that become Temporal Activities. The ones marked SYNC BODY block
-on psycopg and would be registered to run on a thread pool; the rest are already
-genuinely awaitable. Nothing here decides *when* it runs — that is the orchestrator's job.
+Each one is registered as a Temporal Activity via @activity.defn, and the sync/async
+split below is a deliberate contract, not an accident:
+
+  * SYNC ACTIVITY (plain ``def``) — the body blocks on psycopg. Temporal runs these on the
+    worker's ThreadPoolExecutor, so a slow query never stalls the worker's event loop.
+    Writing them as ``async def`` would be a lie that blocks the loop on every query.
+  * ASYNC ACTIVITY (``async def``) — genuinely awaitable I/O: the LLM, or the agent under
+    test over httpx. These run on the event loop, where they belong.
+
+Timeouts and retry policies are NOT set here. They belong to the caller, and live in
+app.temporal.policies so they can be reviewed in one place.
+
+Nothing here decides *when* it runs — that is the orchestrator's job. Every function is
+also callable directly, which is what the current asyncio path still does; @activity.defn
+only attaches metadata.
 """
 import json as _json
+
+from temporalio import activity
 
 from app.config import MAX_SCENARIOS
 from app.core.fixer import explain_and_fix
@@ -37,12 +51,14 @@ from app.db import (
 # ---------------------------------------------------------------------------
 # Agent + suite
 # ---------------------------------------------------------------------------
-async def load_agent(agent_id: int) -> dict | None:
-    """SYNC BODY. The agent row as a plain dict, or None if it no longer exists."""
+@activity.defn
+def load_agent(agent_id: int) -> dict | None:
+    """SYNC ACTIVITY. The agent row as a plain dict, or None if it no longer exists."""
     agent = get_agent(agent_id)
     return dict(agent) if agent is not None else None
 
 
+@activity.defn
 async def prepare_scenarios(
     agent: dict, selected_types: list[str], guidance: str = "", knowledge: str = ""
 ) -> list[dict]:
@@ -77,8 +93,9 @@ async def prepare_scenarios(
     return scenarios[:MAX_SCENARIOS]
 
 
-async def persist_suite(run_id: int, scenarios: list[dict]) -> list[int]:
-    """SYNC BODY. Make `scenarios` the run's scenario set; returns ids in input order.
+@activity.defn
+def persist_suite(run_id: int, scenarios: list[dict]) -> list[int]:
+    """SYNC ACTIVITY. Make `scenarios` the run's scenario set; returns ids in input order.
 
     Replaces rather than appends, so re-executing cannot duplicate the suite.
     """
@@ -88,6 +105,7 @@ async def persist_suite(run_id: int, scenarios: list[dict]) -> list[int]:
 # ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
+@activity.defn
 async def play_scenario(run_id: int, scenario: dict, agent: dict) -> int:
     """HTTP + LLM + DB. Play one scenario against the agent; returns its conversation id.
 
@@ -101,6 +119,7 @@ async def play_scenario(run_id: int, scenario: dict, agent: dict) -> int:
     )
 
 
+@activity.defn
 async def replay_scenario(run_id: int, scenario: dict, agent: dict) -> int:
     """HTTP + LLM + DB. Play a scenario as a deliberately NEW conversation.
 
@@ -110,6 +129,7 @@ async def replay_scenario(run_id: int, scenario: dict, agent: dict) -> int:
     return await run_scenario(run_id, scenario, agent, idem_key=None)
 
 
+@activity.defn
 async def judge_conversation_by_id(conversation_id: int) -> dict:
     """DB + LLM. Score one conversation and persist its verdict.
 
@@ -122,6 +142,7 @@ async def judge_conversation_by_id(conversation_id: int) -> dict:
     return await judge_conversation(conv)
 
 
+@activity.defn
 async def explain_conversation_by_id(conversation_id: int) -> dict:
     """DB + LLM. Explain one failure and suggest a fix. Id in, for the same reason."""
     conv = get_conversation(conversation_id)
@@ -133,33 +154,38 @@ async def explain_conversation_by_id(conversation_id: int) -> dict:
 # ---------------------------------------------------------------------------
 # Run bookkeeping
 # ---------------------------------------------------------------------------
-async def list_conversation_ids(run_id: int) -> list[int]:
-    """SYNC BODY. Every conversation in the run, oldest first."""
+@activity.defn
+def list_conversation_ids(run_id: int) -> list[int]:
+    """SYNC ACTIVITY. Every conversation in the run, oldest first."""
     return [c["id"] for c in get_conversations_for_run(run_id)]
 
 
-async def list_failed_conversation_ids(run_id: int) -> list[int]:
-    """SYNC BODY. Only the conversations the judge failed — the explain+fix branch."""
+@activity.defn
+def list_failed_conversation_ids(run_id: int) -> list[int]:
+    """SYNC ACTIVITY. Only the conversations the judge failed — the explain+fix branch."""
     return [c["id"] for c in get_conversations_for_run(run_id) if c["verdict"] == "fail"]
 
 
-async def finalize_run(run_id: int) -> dict:
-    """SYNC BODY. Score the run, persist the breakdown, and mark it done."""
+@activity.defn
+def finalize_run(run_id: int) -> dict:
+    """SYNC ACTIVITY. Score the run, persist the breakdown, and mark it done."""
     result = compute(run_id)
     update_run(run_id, status="done", finished=True)
     return result
 
 
-async def fail_run(run_id: int) -> None:
-    """SYNC BODY. Mark a run as errored so it never hangs in 'running'."""
+@activity.defn
+def fail_run(run_id: int) -> None:
+    """SYNC ACTIVITY. Mark a run as errored so it never hangs in 'running'."""
     update_run(run_id, status="error", finished=True)
 
 
 # ---------------------------------------------------------------------------
 # Replay context
 # ---------------------------------------------------------------------------
-async def load_replay_context(conversation_id: int) -> dict | None:
-    """SYNC BODY. Everything a replay needs, in one round trip.
+@activity.defn
+def load_replay_context(conversation_id: int) -> dict | None:
+    """SYNC ACTIVITY. Everything a replay needs, in one round trip.
 
     Returns ``{"run_id", "scenario", "agent"}`` — the scenario shaped exactly as the
     runner expects it — or None if any part of the chain is missing.
