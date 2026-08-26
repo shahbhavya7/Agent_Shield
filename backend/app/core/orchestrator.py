@@ -1,10 +1,14 @@
 """Run orchestration — sequencing, fan-out, and failure policy. No I/O of its own.
 
-Three workflows live here:
+  start_run           SUPERSEDED by app.temporal.workflows.AgentTestWorkflow
+  start_run_group     SUPERSEDED by app.temporal.workflows.RunGroupWorkflow
+  replay_conversation still live — POST /conversations/{id}/replay runs this inline
 
-  start_run           one agent: suite -> play -> judge -> explain failures -> score
-  start_run_group     N agents at once, one independent run each
-  replay_conversation a single scenario re-played as a new conversation
+`start_run` and `start_run_group` are no longer on the request path: POST /runs and
+POST /runs/group submit a Temporal workflow instead. They are kept, not deleted, because
+they are the readable reference implementation the workflows were translated from and the
+only way to execute a run with no Temporal server present. Delete them once that is no
+longer worth having — but delete them deliberately, not by accident.
 
 Every external call goes through `app.core.activities`; nothing in this module touches
 PostgreSQL, the LLM, or the agent under test directly. The activities that are awaited
