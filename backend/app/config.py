@@ -32,13 +32,23 @@ TEMPORAL_NAMESPACE: str = os.getenv("TEMPORAL_NAMESPACE", "default")
 TEMPORAL_TASK_QUEUE: str = os.getenv("TEMPORAL_TASK_QUEUE", "agentshield")
 
 # --- Concurrency -------------------------------------------------------------
-# How many selected agents are crash-tested at the same time. Each one is an
-# independent run, so this is the width of the parallel fan-out.
+# How many agents one batch crash-tests at the same time. Under Temporal this is passed
+# into RunGroupWorkflow and enforced there, so it bounds the children of ONE batch — it is
+# no longer a process-wide cap. WORK_CONCURRENCY below is what bounds total load globally.
 AGENT_CONCURRENCY: int = int(os.getenv("AGENT_CONCURRENCY", "3"))
-# Ceiling on in-flight scenario/judge/fix work across the WHOLE process, shared by
-# every run in flight. Without this, N parallel agents would each open their own
-# window onto the LLM and the agents under test.
+# Ceiling on in-flight scenario/judge/fix work, applied by the Temporal worker as
+# max_concurrent_activities. Every workflow on that worker draws from this one pool, so it
+# is a genuinely global limit — stronger than the per-process asyncio semaphore it
+# replaced. Without it, N concurrent agent tests would each open their own window onto the
+# LLM and the agents under test.
 WORK_CONCURRENCY: int = int(os.getenv("WORK_CONCURRENCY", "6"))
+
+# How many workflow *decisions* a worker may process at once. This does NOT limit how many
+# agent tests run — a workflow waiting on an activity holds no slot at all. Keep it
+# generous: setting it low throttles the scheduling of work without capping the work
+# itself, which starves concurrency instead of bounding it. WORK_CONCURRENCY is the knob
+# that bounds actual load.
+WORKFLOW_TASK_CONCURRENCY: int = int(os.getenv("WORKFLOW_TASK_CONCURRENCY", "100"))
 
 # Rough $ per 1K tokens for the agent-under-test, used to estimate run cost.
 # Default is a blended gpt-4o-mini rate; override per model via .env.

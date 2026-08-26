@@ -25,19 +25,33 @@ from concurrent.futures import ThreadPoolExecutor
 from temporalio.worker import Worker
 
 from app.config import (
+    AGENT_CONCURRENCY,
     TEMPORAL_ADDRESS,
     TEMPORAL_NAMESPACE,
     TEMPORAL_TASK_QUEUE,
     WORK_CONCURRENCY,
+    WORKFLOW_TASK_CONCURRENCY,
 )
 from app.temporal.client import get_client
-from app.temporal.health import HealthWorkflow, ping, thread_probe
+from app.temporal.health import (
+    ConcurrencyProbeWorkflow,
+    HealthWorkflow,
+    NonRetryableProbeWorkflow,
+    RetryProbeWorkflow,
+    always_fails_with_value_error,
+    flaky_external_call,
+    ping,
+    slow_probe,
+    thread_probe,
+)
 from app.temporal.policies import ALL_ACTIVITIES, options_for
 from app.temporal.workflows import AgentTestWorkflow, RunGroupWorkflow
 
 # The health check's own activities, kept apart from the real ones so it is obvious which
 # are disposable wiring checks.
-HEALTH_ACTIVITIES = [ping, thread_probe]
+HEALTH_ACTIVITIES = [
+    ping, thread_probe, flaky_external_call, always_fails_with_value_error, slow_probe,
+]
 
 
 def _check_policies() -> None:
@@ -86,29 +100,49 @@ async def main() -> None:
         max_workers=WORK_CONCURRENCY, thread_name_prefix="activity"
     )
 
+    # Product workflows first, then the disposable wiring/policy probes.
+    workflows = [RunGroupWorkflow, AgentTestWorkflow]
+    probe_workflows = [
+        HealthWorkflow, RetryProbeWorkflow, NonRetryableProbeWorkflow,
+        ConcurrencyProbeWorkflow,
+    ]
+
     worker = Worker(
         client,
         task_queue=TEMPORAL_TASK_QUEUE,
-        workflows=[RunGroupWorkflow, AgentTestWorkflow, HealthWorkflow],
+        workflows=[*workflows, *probe_workflows],
         activities=activities,
-        # This is where WORK_CONCURRENCY ends up living. As a worker setting it is a real
-        # global ceiling, unlike the in-process semaphore it replaces — which only ever
-        # bounded a single uvicorn process.
+        # THE limit that bounds real load. Every workflow on this worker draws activity
+        # slots from this one pool, so N concurrent agent tests share it rather than each
+        # getting their own window onto the LLM and the agents under test. As a worker
+        # setting it is a genuinely global ceiling, unlike the in-process asyncio semaphore
+        # it replaces, which only ever bounded a single uvicorn process.
         max_concurrent_activities=WORK_CONCURRENCY,
+        # Workflow *decisions*, not agent tests. Set generously and on purpose: a workflow
+        # waiting on an activity holds no slot here, so a small value would throttle
+        # scheduling without capping any work — starving concurrency instead of bounding
+        # it. Independent agent-test workflows must be free to interleave here.
+        max_concurrent_workflow_tasks=WORKFLOW_TASK_CONCURRENCY,
         activity_executor=activity_executor,
     )
 
     print(
-        "[worker] registered workflows: RunGroupWorkflow (parent), "
-        "AgentTestWorkflow (child), HealthWorkflow (wiring check)",
+        "[worker] workflows: " + ", ".join(w.__name__ for w in workflows)
+        + "  |  probes: " + ", ".join(w.__name__ for w in probe_workflows),
         flush=True,
     )
     print(f"[worker] registered {len(activities)} activities", flush=True)
     print(f"[worker]   async (event loop): {', '.join(sorted(async_names))}", flush=True)
     print(f"[worker]   sync  (thread pool): {', '.join(sorted(sync_names))}", flush=True)
     print(
-        f"[worker] polling task queue '{TEMPORAL_TASK_QUEUE}' "
-        f"(max {WORK_CONCURRENCY} concurrent activities) — Ctrl-C to stop",
+        "[worker] concurrency: "
+        f"{WORK_CONCURRENCY} activities (global load ceiling), "
+        f"{WORKFLOW_TASK_CONCURRENCY} workflow tasks (scheduling headroom), "
+        f"{AGENT_CONCURRENCY} agents per batch (set by the caller, enforced in the workflow)",
+        flush=True,
+    )
+    print(
+        f"[worker] polling task queue '{TEMPORAL_TASK_QUEUE}' — Ctrl-C to stop",
         flush=True,
     )
     await worker.run()

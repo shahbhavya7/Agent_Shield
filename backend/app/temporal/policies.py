@@ -6,28 +6,31 @@ reviewed together, and a workflow just says::
 
     await workflow.execute_activity(load_agent, agent_id, **options_for(load_agent))
 
-Two rules shaped every entry below.
+Three rules shaped every entry below.
 
-**Only retry what is safe to repeat.** Retrying is only correct where re-execution
-converges rather than duplicating, which is what the idempotency work bought us:
-`persist_suite` replaces a run's scenario set, `play_scenario` is keyed on (run, scenario),
-and the judge/fix activities are plain UPDATEs. The one activity that is deliberately NOT
-idempotent — `replay_scenario`, which must create a new conversation every time — is the
-one activity configured never to retry.
+**Retry only what is proven safe to repeat.** A retry is a re-execution, so it is only
+correct where re-execution converges instead of duplicating. Every retrying activity below
+records the evidence for that in an `idempotency:` note — not an assumption, a check that
+was run. The one activity that is deliberately NOT idempotent (`replay_scenario`, which
+must create a new conversation every time) is the one configured never to retry.
 
-**Only spend what the work is worth.** An LLM-backed activity that has already burned
-tokens gets fewer attempts than a cheap database read, because a retry there costs real
-money rather than a few milliseconds.
+**Retry external services, back off, and don't retry your own bugs.** The failures worth
+retrying are transient and not our fault: a dropped database connection, a provider rate
+limit, a 5xx. Every policy uses exponential backoff. `ValueError`/`KeyError`/`TypeError`
+are marked non-retryable on the paid activities, because a bad-data crash will crash
+identically on attempt two — it just costs more. Provider auth errors likewise: a rejected
+API key does not become accepted by waiting.
 
-Deliberately NOT set here:
+**Cap the total, not just the attempt.** `start_to_close_timeout` bounds one attempt;
+`schedule_to_close_timeout` bounds the whole sequence including backoff waits, so a
+pathological retry loop cannot hold a work slot indefinitely. Each cap is set above the
+worst realistic case (attempts x timeout + backoff) with margin, so it never truncates
+legitimate work.
 
-* ``heartbeat_timeout`` — a heartbeat timeout without matching ``activity.heartbeat()``
-  calls in the body would fail healthy long activities. When the framework starts testing
-  real-time calling agents, `play_scenario` needs to heartbeat first; the timeout goes in
-  at the same time, not before.
-* ``schedule_to_close_timeout`` — an overall cap including retries. Worth adding once
-  there is real data on how long a run takes end to end; guessing now would just truncate
-  legitimate work.
+Still deliberately NOT set: ``heartbeat_timeout``. A heartbeat timeout without matching
+``activity.heartbeat()`` calls in the body would fail healthy long activities. When the
+framework starts testing real-time calling agents, `play_scenario` needs to heartbeat
+first; the timeout goes in at the same time, not before.
 """
 from datetime import timedelta
 from typing import Any, Callable
@@ -49,6 +52,13 @@ from app.core.activities import (
     replay_scenario,
 )
 
+# Errors that will fail identically on every attempt. Temporal matches on the exception
+# class name, so these are strings.
+_OUR_BUGS = ["ValueError", "KeyError", "TypeError", "AttributeError"]
+# A rejected credential does not become accepted by waiting. openai SDK class names.
+_PROVIDER_REFUSALS = ["AuthenticationError", "PermissionDeniedError", "NotFoundError"]
+
+
 # --- retry shapes, named by intent rather than by their numbers ---------------
 
 # A quick query. Worth retrying: the realistic failure is a dropped connection, and
@@ -58,6 +68,7 @@ _DB = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_interval=timedelta(seconds=10),
     maximum_attempts=3,
+    non_retryable_error_types=_OUR_BUGS,
 )
 
 # Must land, or the run is stranded in "running" forever with nothing to correct it.
@@ -67,15 +78,17 @@ _MUST_LAND = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_interval=timedelta(seconds=30),
     maximum_attempts=5,
+    non_retryable_error_types=_OUR_BUGS,
 )
 
-# An LLM call. Rate limits and 5xx from the provider are the common failures and both
-# clear on their own, so back off further before trying again.
+# An LLM call. Rate limits and provider 5xx are the common failures and both clear on
+# their own, so back off further before trying again.
 _LLM = RetryPolicy(
     initial_interval=timedelta(seconds=2),
     backoff_coefficient=2.0,
     maximum_interval=timedelta(seconds=30),
     maximum_attempts=3,
+    non_retryable_error_types=[*_OUR_BUGS, *_PROVIDER_REFUSALS],
 )
 
 # Multi-turn work that has already spent tokens. Retry once, not twice: a second full
@@ -85,6 +98,7 @@ _EXPENSIVE = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_interval=timedelta(seconds=20),
     maximum_attempts=2,
+    non_retryable_error_types=[*_OUR_BUGS, *_PROVIDER_REFUSALS],
 )
 
 # Never retry. For work whose whole purpose is to create something new, where a second
@@ -96,67 +110,106 @@ _NEVER = RetryPolicy(maximum_attempts=1)
 # Keyed by activity name (what @activity.defn registers), so a workflow can look options
 # up either by the function or by its registered name.
 _OPTIONS: dict[str, dict[str, Any]] = {
-    # Cheap database reads and writes.
+    # ---- reads. Nothing to duplicate, so retrying is free of consequence. ----
     "load_agent": {
+        # idempotency: read-only SELECT.
         "start_to_close_timeout": timedelta(seconds=10),
-        "retry_policy": _DB,
-    },
-    "persist_suite": {
-        # Replaces the run's scenario set, so repeating it converges.
-        "start_to_close_timeout": timedelta(seconds=30),
+        "schedule_to_close_timeout": timedelta(seconds=90),
         "retry_policy": _DB,
     },
     "list_conversation_ids": {
+        # idempotency: read-only SELECT.
         "start_to_close_timeout": timedelta(seconds=10),
+        "schedule_to_close_timeout": timedelta(seconds=90),
         "retry_policy": _DB,
     },
     "list_failed_conversation_ids": {
+        # idempotency: read-only SELECT.
         "start_to_close_timeout": timedelta(seconds=10),
+        "schedule_to_close_timeout": timedelta(seconds=90),
         "retry_policy": _DB,
     },
     "load_replay_context": {
+        # idempotency: read-only SELECTs.
         "start_to_close_timeout": timedelta(seconds=10),
+        "schedule_to_close_timeout": timedelta(seconds=90),
+        "retry_policy": _DB,
+    },
+
+    # ---- writes. Each retries only because its convergence was actually tested. ----
+    "persist_suite": {
+        # idempotency: VERIFIED. replace_scenarios deletes the run's scenarios before
+        # inserting, so calling it twice with the same suite leaves the same row count
+        # (checked: two calls with a 2-scenario suite -> 2 rows, not 4). Titles are
+        # LLM-generated and collide within a run, which is why replacement — not an
+        # upsert on a natural key — is what makes this safe.
+        "start_to_close_timeout": timedelta(seconds=30),
+        "schedule_to_close_timeout": timedelta(minutes=2),
         "retry_policy": _DB,
     },
     "finalize_run": {
-        # Reads every conversation, then writes the score. Deterministic given the same
-        # conversations, so a repeat produces the same row.
+        # idempotency: VERIFIED. Reads every conversation and writes one score; the score
+        # is a pure function of those conversations (checked: re-running it on a finished
+        # run reproduced the same 100.0). A repeat rewrites identical values.
         "start_to_close_timeout": timedelta(seconds=30),
+        "schedule_to_close_timeout": timedelta(minutes=2),
         "retry_policy": _DB,
     },
     "fail_run": {
+        # idempotency: a single UPDATE to fixed values. Repeating it only rewrites
+        # finished_at, which no logic reads for correctness.
         "start_to_close_timeout": timedelta(seconds=10),
+        "schedule_to_close_timeout": timedelta(minutes=3),
         "retry_policy": _MUST_LAND,
     },
 
-    # LLM-backed work.
+    # ---- external services: the LLM. ----
     "prepare_scenarios": {
-        # Generation, plus agent auto-discovery when the agent has no docs or description,
-        # which is several sequential LLM and HTTP calls.
+        # idempotency: persists nothing at all — pure generation. A retry costs tokens and
+        # returns a different suite, which is fine because nothing has been written yet.
+        # Slow: generation plus agent auto-discovery when the agent has no docs, which is
+        # several sequential LLM and HTTP calls.
         "start_to_close_timeout": timedelta(minutes=3),
+        "schedule_to_close_timeout": timedelta(minutes=12),
         "retry_policy": _LLM,
     },
     "judge_conversation_by_id": {
+        # idempotency: VERIFIED by construction — one UPDATE of the verdict columns on one
+        # conversation. A retry overwrites its own previous verdict; it cannot accumulate.
         "start_to_close_timeout": timedelta(minutes=2),
+        "schedule_to_close_timeout": timedelta(minutes=10),
         "retry_policy": _LLM,
     },
     "explain_conversation_by_id": {
+        # idempotency: VERIFIED by construction — one UPDATE of explanation/suggested_fix.
         "start_to_close_timeout": timedelta(minutes=2),
+        "schedule_to_close_timeout": timedelta(minutes=10),
         "retry_policy": _LLM,
     },
 
-    # Playing a conversation against the agent under test — the expensive one.
+    # ---- external services: the agent under test. ----
     "play_scenario": {
-        # Up to five tester turns, each an HTTP call to the agent (30s adapter timeout)
-        # plus a possible LLM follow-up.
+        # idempotency: VERIFIED. Keyed on (run, scenario) via conversations.idem_key, so a
+        # retry resolves to the same conversation, and clear_messages wipes the transcript
+        # first so a shorter second attempt cannot strand tail turns (checked: 3 turns then
+        # a 2-turn retry -> 2 turns, not 5). A unique index on (conversation_id,
+        # turn_index) blocks a concurrent double-write.
+        #
+        # Worth knowing: the HTTP adapter swallows transport errors and records them as a
+        # failed turn rather than raising, so a transient agent outage does NOT reach this
+        # retry policy — it lands in the trace as data. That is existing behaviour, and it
+        # is what makes injected api_* faults work. This policy therefore covers the LLM
+        # follow-up call and the database writes inside the activity.
         "start_to_close_timeout": timedelta(minutes=5),
+        "schedule_to_close_timeout": timedelta(minutes=15),
         "retry_policy": _EXPENSIVE,
     },
     "replay_scenario": {
-        # Deliberately not idempotent: it exists to produce a NEW conversation. A retry
-        # would leave a spurious extra conversation behind, so it gets exactly one attempt
-        # and a failed replay is surfaced to the user instead.
+        # idempotency: NONE, deliberately. It exists to produce a NEW conversation, so a
+        # retry would leave a spurious extra one behind. Exactly one attempt; a failed
+        # replay is surfaced to the user instead of silently duplicated.
         "start_to_close_timeout": timedelta(minutes=5),
+        "schedule_to_close_timeout": timedelta(minutes=6),
         "retry_policy": _NEVER,
     },
 }
