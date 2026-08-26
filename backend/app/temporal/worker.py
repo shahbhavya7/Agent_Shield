@@ -8,9 +8,10 @@ It needs a Temporal server to poll:
 
 The worker is a SEPARATE process from FastAPI on purpose. FastAPI serves requests and
 knows nothing about Temporal; the worker owns execution. Every activity in
-app.core.activities is registered here, but no workflow uses them yet — the live path is
-still the asyncio orchestrator — so starting or stopping this process does not affect the
-running application.
+app.core.activities is registered here, and RunGroupWorkflow/AgentTestWorkflow orchestrate
+them. Nothing calls those workflows on the request path yet — FastAPI still runs the
+asyncio orchestrator — so starting or stopping this process does not affect the running
+application.
 
 Sync vs async activities is the load-bearing detail. Activities whose bodies block on
 psycopg are plain `def`, and Temporal dispatches those to `activity_executor` — a thread
@@ -32,6 +33,7 @@ from app.config import (
 from app.temporal.client import get_client
 from app.temporal.health import HealthWorkflow, ping, thread_probe
 from app.temporal.policies import ALL_ACTIVITIES, options_for
+from app.temporal.workflows import AgentTestWorkflow, RunGroupWorkflow
 
 # The health check's own activities, kept apart from the real ones so it is obvious which
 # are disposable wiring checks.
@@ -87,7 +89,7 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue=TEMPORAL_TASK_QUEUE,
-        workflows=[HealthWorkflow],
+        workflows=[RunGroupWorkflow, AgentTestWorkflow, HealthWorkflow],
         activities=activities,
         # This is where WORK_CONCURRENCY ends up living. As a worker setting it is a real
         # global ceiling, unlike the in-process semaphore it replaces — which only ever
@@ -96,6 +98,11 @@ async def main() -> None:
         activity_executor=activity_executor,
     )
 
+    print(
+        "[worker] registered workflows: RunGroupWorkflow (parent), "
+        "AgentTestWorkflow (child), HealthWorkflow (wiring check)",
+        flush=True,
+    )
     print(f"[worker] registered {len(activities)} activities", flush=True)
     print(f"[worker]   async (event loop): {', '.join(sorted(async_names))}", flush=True)
     print(f"[worker]   sync  (thread pool): {', '.join(sorted(sync_names))}", flush=True)
