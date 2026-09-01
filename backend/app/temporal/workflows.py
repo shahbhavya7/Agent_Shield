@@ -47,6 +47,11 @@ with workflow.unsafe.imports_passed_through():
 # value in explicitly (see app.config.AGENT_CONCURRENCY), which is what makes it tunable
 # without making it non-deterministic.
 DEFAULT_AGENT_CONCURRENCY = 3
+# One child's slice of the worker's activity pool. A literal for the same replay-safety
+# reason as above; the router computes the real value from WORK_CONCURRENCY and how many
+# agents are actually running, and passes it in. The shares of concurrently-running
+# children sum to the worker ceiling, so this divides the pool rather than multiplying it.
+DEFAULT_WORK_SHARE = 2
 
 
 @dataclass
@@ -64,6 +69,9 @@ class AgentTestInput:
     # The user-reviewed suite. When present it is executed verbatim and nothing is
     # generated — same contract as start_run's `scenarios` argument.
     scenarios: list[dict] | None = None
+    # How many of this run's activities may be in flight at once — its fair share of the
+    # worker's pool, so sibling agents progress together instead of queueing behind it.
+    work_share: int = DEFAULT_WORK_SHARE
 
 
 @dataclass
@@ -74,23 +82,41 @@ class RunGroupInput:
     agent_concurrency: int = DEFAULT_AGENT_CONCURRENCY
 
 
-async def _all_settled(coros: list, labels: list[str]) -> None:
-    """Await everything, logging individual failures instead of propagating them.
+async def _bounded_gather(
+    factories: list, labels: list[str], limit: int
+) -> None:
+    """Run every item concurrently, at most `limit` at a time, logging failures.
 
-    This is the workflow-side equivalent of the orchestrator's `_fan_out` failure policy:
-    one bad scenario must never fail the rest of the run. The difference is that by the
-    time an exception reaches here, the activity has already exhausted its retry policy —
-    so unlike the asyncio version, a merely transient error no longer loses the result.
+    Two jobs in one place.
 
-    Cancellation is re-raised rather than logged: `return_exceptions=True` would otherwise
-    turn a cancelled workflow into a silently ignored result.
+    *Failure policy* — the workflow-side equivalent of the orchestrator's `_fan_out`: one
+    bad scenario must never fail the rest of the run. By the time an exception reaches
+    here the activity has already exhausted its retry policy, so unlike the asyncio
+    version a merely transient error no longer loses the result. Cancellation is the one
+    thing re-raised, so a cancelled workflow is never silently swallowed.
+
+    *Fair share* — `limit` is this child's slice of the worker's activity pool. It matters
+    that the activity is CREATED inside the semaphore, not merely awaited there: Temporal
+    schedules an activity when its coroutine is awaited, so building them all up front
+    would queue the whole batch regardless of the limit. Hence factories rather than
+    coroutines.
+
+    Without this limit the pool is claimed first-come-first-served, and a child that wins
+    the scheduling race by milliseconds takes every slot — which is what made two "parallel"
+    agents run one after the other.
     """
-    results = await asyncio.gather(*coros, return_exceptions=True)
-    for label, result in zip(labels, results):
-        if isinstance(result, asyncio.CancelledError):
-            raise result
-        if isinstance(result, BaseException):
-            workflow.logger.warning("%s failed: %s", label, result)
+    sem = asyncio.Semaphore(max(1, limit))
+
+    async def _one(make, label: str) -> None:
+        async with sem:
+            try:
+                await make()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                workflow.logger.warning("%s failed: %s", label, e)
+
+    await asyncio.gather(*(_one(m, l) for m, l in zip(factories, labels)))
 
 
 @workflow.defn
@@ -133,38 +159,40 @@ class AgentTestWorkflow:
             for scenario, scenario_id in zip(suite, scenario_ids):
                 scenario["_id"] = scenario_id
 
-            # 3) Play every scenario against the agent.
+            # 3) Play every scenario against the agent, bounded by this run's share.
             #
-            # No semaphore here on purpose. The old _WORK ceiling was a per-process
-            # asyncio semaphore; its replacement is the worker's max_concurrent_activities,
-            # which is a genuinely global limit. Re-adding a per-workflow semaphore would
-            # reintroduce exactly the per-run multiplication that _WORK was shared to avoid.
-            await _all_settled(
+            # The worker's max_concurrent_activities is still the global ceiling; this
+            # share only decides how much of it ONE run may hold, so sibling agents get
+            # slots too. Shares of concurrently-running children sum to the ceiling, so
+            # this divides the pool rather than multiplying it.
+            await _bounded_gather(
                 [
-                    workflow.execute_activity(
+                    (lambda s=scenario: workflow.execute_activity(
                         play_scenario,
-                        args=[inp.run_id, scenario, agent],
+                        args=[inp.run_id, s, agent],
                         **options_for(play_scenario),
-                    )
+                    ))
                     for scenario in suite
                 ],
                 [f"scenario '{s.get('title')}'" for s in suite],
+                inp.work_share,
             )
 
             # 4) Judge every conversation that resulted.
             conversation_ids = await workflow.execute_activity(
                 list_conversation_ids, inp.run_id, **options_for(list_conversation_ids)
             )
-            await _all_settled(
+            await _bounded_gather(
                 [
-                    workflow.execute_activity(
+                    (lambda c=cid: workflow.execute_activity(
                         judge_conversation_by_id,
-                        cid,
+                        c,
                         **options_for(judge_conversation_by_id),
-                    )
+                    ))
                     for cid in conversation_ids
                 ],
                 [f"judge for conv {cid}" for cid in conversation_ids],
+                inp.work_share,
             )
 
             # 5) Explain + suggest fix — FAILURES ONLY (the pass/fail branch).
@@ -173,16 +201,17 @@ class AgentTestWorkflow:
                 inp.run_id,
                 **options_for(list_failed_conversation_ids),
             )
-            await _all_settled(
+            await _bounded_gather(
                 [
-                    workflow.execute_activity(
+                    (lambda c=cid: workflow.execute_activity(
                         explain_conversation_by_id,
-                        cid,
+                        c,
                         **options_for(explain_conversation_by_id),
-                    )
+                    ))
                     for cid in failed_ids
                 ],
                 [f"fix for conv {cid}" for cid in failed_ids],
+                inp.work_share,
             )
 
             # 6) Score + finalize.

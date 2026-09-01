@@ -41,7 +41,15 @@ AGENT_CONCURRENCY: int = int(os.getenv("AGENT_CONCURRENCY", "3"))
 # is a genuinely global limit — stronger than the per-process asyncio semaphore it
 # replaced. Without it, N concurrent agent tests would each open their own window onto the
 # LLM and the agents under test.
-WORK_CONCURRENCY: int = int(os.getenv("WORK_CONCURRENCY", "6"))
+#
+# Set to 3 x AGENT_CONCURRENCY, so that even at maximum fan-out every agent gets 3
+# concurrent scenarios rather than a token 1 or 2. Measured against the sample agents:
+# median response time is flat from 1 to 9 concurrent requests (~0.9s) and only the tail
+# starts moving at 12 (max 3.8s). Since the fair share means ONE agent never sees more
+# than WORK_CONCURRENCY requests at a time, 9 keeps per-agent load inside that flat zone
+# — which matters because load-induced timeouts would show up as the agent's failures,
+# not ours. Lower it for a slower or more fragile agent under test.
+WORK_CONCURRENCY: int = int(os.getenv("WORK_CONCURRENCY", "9"))
 
 # How many workflow *decisions* a worker may process at once. This does NOT limit how many
 # agent tests run — a workflow waiting on an activity holds no slot at all. Keep it

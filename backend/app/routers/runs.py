@@ -10,7 +10,7 @@ import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.config import AGENT_CONCURRENCY, TEMPORAL_TASK_QUEUE
+from app.config import AGENT_CONCURRENCY, TEMPORAL_TASK_QUEUE, WORK_CONCURRENCY
 from app.core.activities import prepare_scenarios
 from app.core.scenarios import normalize_scenarios
 from app.temporal.client import get_client
@@ -181,6 +181,14 @@ async def _launch_group(
             )
         prepared.append((t, reviewed, sources))
 
+    # Each run's fair slice of the worker's activity pool. Divided by how many children
+    # will actually be in flight — that is capped by AGENT_CONCURRENCY, so five selected
+    # agents still only split the pool three ways. Without this the pool is claimed
+    # first-come-first-served and whichever child schedules first takes every slot, which
+    # makes "parallel" agents run one after another.
+    concurrent_children = max(1, min(len(prepared), AGENT_CONCURRENCY))
+    work_share = max(1, WORK_CONCURRENCY // concurrent_children)
+
     group_id = insert_run_group()
     launched: list[dict] = []
     workflow_targets: list[AgentTestInput] = []
@@ -201,6 +209,7 @@ async def _launch_group(
             guidance=guidance,
             knowledge=knowledge,
             scenarios=reviewed or None,
+            work_share=work_share,
         ))
 
     try:
