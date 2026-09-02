@@ -219,8 +219,10 @@ class AgentTestWorkflow:
                 finalize_run, inp.run_id, **options_for(finalize_run)
             )
             return {
+                # finalize_run reports "error" when the agent never once answered, and the
+                # group summary below counts anything other than "done" as an errored run.
+                "status": result.get("status", "done"),
                 "run_id": inp.run_id,
-                "status": "done",
                 "reliability_score": result.get("reliability_score"),
                 "scenarios": len(suite),
                 "conversations": len(conversation_ids),

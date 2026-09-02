@@ -118,5 +118,6 @@ SAMPLE_AGENT_URLS: dict[str, str] = {
     "banking_bot": os.getenv("BANKING_BOT_URL", "http://localhost:8003/chat"),
     "hr_bot": os.getenv("HR_BOT_URL", "http://localhost:8004/chat"),
     "insurance_bot": os.getenv("INSURANCE_BOT_URL", "http://localhost:8005/chat"),
+    "airline_bot": os.getenv("AIRLINE_BOT_URL", "http://localhost:8006/chat"),
     "sample_rag_bot": SAMPLE_RAG_BOT_URL,
 }

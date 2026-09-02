@@ -14,6 +14,11 @@ from app.config import LLM_MODEL, OPENAI_API_KEY
 # error only surfaces on an actual call, which is what we want for smoke tests.
 _client = AsyncOpenAI(api_key=OPENAI_API_KEY or "missing-key")
 
+# Fixed seed for callers that need a repeatable sample (the Judge). OpenAI treats `seed`
+# as best-effort: combined with temperature=0 it makes repeated calls on identical input
+# reproduce, but it is not a hard guarantee.
+FIXED_SEED = 42
+
 
 def _strip_fences(text: str) -> str:
     """Defensively remove ```json ... ``` fences some models emit despite json_mode."""
@@ -30,6 +35,7 @@ async def chat(
     json_mode: bool = False,
     temperature: float = 0.2,
     model: Optional[str] = None,
+    seed: Optional[int] = None,
 ) -> Any:
     """Call the chat model.
 
@@ -44,6 +50,8 @@ async def chat(
         "messages": full_messages,
         "temperature": temperature,
     }
+    if seed is not None:
+        kwargs["seed"] = seed
     if json_mode:
         # OpenAI requires the word "json" somewhere in the prompt for this mode.
         if "json" not in system.lower():

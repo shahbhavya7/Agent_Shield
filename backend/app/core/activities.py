@@ -32,8 +32,9 @@ import json as _json
 from temporalio import activity
 
 from app.config import MAX_SCENARIOS
+from app.core.adapter import SYSTEM_FAULTS
 from app.core.fixer import explain_and_fix
-from app.core.judge import judge_conversation
+from app.core.judge import _endpoint_never_responded, judge_conversation
 from app.core.runner import run_scenario
 from app.core.scenarios import generate_scenarios
 from app.core.scoring import compute
@@ -41,6 +42,7 @@ from app.db import (
     get_agent,
     get_conversation,
     get_conversations_for_run,
+    get_messages,
     get_run,
     get_scenario,
     replace_scenarios,
@@ -166,12 +168,43 @@ def list_failed_conversation_ids(run_id: int) -> list[int]:
     return [c["id"] for c in get_conversations_for_run(run_id) if c["verdict"] == "fail"]
 
 
+def _agent_never_reachable(run_id: int) -> bool:
+    """True when every scenario that was SUPPOSED to reach the agent failed to connect.
+
+    Reuses the Judge's per-conversation check, so "the run never reached the agent" means
+    exactly "every conversation never reached the agent" — one definition, not two.
+
+    Scenarios carrying an injected system fault are excluded: AgentShield deliberately
+    never calls the endpoint for those, so their empty transcripts say nothing about
+    whether the agent was up. A suite made up entirely of them is a normal run.
+    """
+    genuine = []
+    for c in get_conversations_for_run(run_id):
+        scenario = get_scenario(dict(c)["scenario_id"])
+        fault = (dict(scenario).get("assigned_fault") if scenario else None) or "none"
+        if fault not in SYSTEM_FAULTS:
+            genuine.append(dict(c))
+    if not genuine:
+        return False
+    return all(
+        _endpoint_never_responded([dict(m) for m in get_messages(c["id"])])
+        for c in genuine
+    )
+
+
 @activity.defn
 def finalize_run(run_id: int) -> dict:
-    """SYNC ACTIVITY. Score the run, persist the breakdown, and mark it done."""
+    """SYNC ACTIVITY. Score the run, persist the breakdown, and mark it done.
+
+    A run whose agent never once answered is marked "error" instead of "done". The score
+    is still computed and stored (0.0 — every conversation is a system failure), but the
+    status then says the endpoint was unreachable rather than that the agent scored badly.
+    Partially reachable runs are untouched: one answered turn makes it a real result.
+    """
     result = compute(run_id)
-    update_run(run_id, status="done", finished=True)
-    return result
+    status = "error" if _agent_never_reachable(run_id) else "done"
+    update_run(run_id, status=status, finished=True)
+    return {**result, "status": status}
 
 
 @activity.defn

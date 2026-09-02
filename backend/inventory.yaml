@@ -11,6 +11,7 @@ customers:
     agents:
       - banking_bot   # NorthBank Support
       - hr_bot        # PeopleDesk HR Assistant
+      - airline_bot   # SkyRoute Airways Support
 
   - name: Customer 2
     agents:
