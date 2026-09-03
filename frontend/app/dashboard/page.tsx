@@ -386,7 +386,10 @@ export default function DashboardPage() {
 
   const plannedScenarios = suites.reduce((n, s) => n + s.length, 0);
 
-  const canVerify = agentName.trim().length > 0 && endpointUrl.trim().length > 0;
+  const canVerify =
+    agentName.trim().length > 0 &&
+    endpointUrl.trim().length > 0 &&
+    (knowledgeText.trim().length > 0 || aboutText.trim().length > 0);
   const canGenerate = selectedTests.length > 0 && !generating;
   const canRunTest = plannedScenarios > 0 && !starting && !generating;
   const aiCount = testCases.filter((c) => c.source === "ai").length;
@@ -953,7 +956,7 @@ export default function DashboardPage() {
 
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">
-                      Agent knowledge <span className="text-slate-600">(optional — all three tiers below are optional)</span>
+                      Agent knowledge <span className="text-[#F87171]">(required — upload docs or describe the agent)</span>
                     </label>
 
                     {/* Tier 1: upload docs */}
@@ -983,17 +986,9 @@ export default function DashboardPage() {
                         value={aboutText}
                         onChange={(e) => setAboutText(e.target.value)}
                         rows={2}
-                        placeholder="…or just describe the agent (optional), e.g. 'A retail banking assistant: transfers, overdraft fees, fraud, loans.'"
+                        placeholder="…or describe the agent, e.g. 'A retail banking assistant: transfers, overdraft fees, fraud, loans.'"
                         className="mt-3 w-full rounded-lg border border-white/12 bg-white/2 px-4 py-3 text-sm text-[#F8FAFC] outline-none transition-colors focus:border-white/30 placeholder:text-slate-600"
                       />
-                    )}
-
-                    {/* Tier 3: auto-discovery note */}
-                    {!knowledgeFile && !aboutText.trim() && (
-                      <p className="mt-2 flex items-center gap-2 text-xs text-slate-500">
-                        <ScanSearch className="h-3.5 w-3.5" strokeWidth={1.5} />
-                        Leave both empty — AgentShield will probe the agent and figure out its domain itself.
-                      </p>
                     )}
                   </div>
 

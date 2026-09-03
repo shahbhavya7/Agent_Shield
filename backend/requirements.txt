@@ -6,3 +6,4 @@ openai
 python-dotenv
 psycopg[binary]
 pyyaml
+temporalio

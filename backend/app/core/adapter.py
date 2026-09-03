@@ -45,6 +45,18 @@ SAMPLE_AGENT_DESCRIPTIONS: dict[str, str] = {
         "about claim filing windows, deductibles, claim processing times, roadside assistance, "
         "glass repair, rental car coverage, premium grace periods, and total-loss valuation."
     ),
+    "airline_bot": (
+        "SkyRoute Airways' flight support assistant. Answers passenger questions about "
+        "carry-on and checked baggage allowances and fees, flight change fees, cancellation "
+        "and refund rules, check-in and gate cut-off times, seat selection charges, the "
+        "SkyMiles loyalty programme, and delay compensation."
+    ),
+    "telecom_bot": (
+        "ConnectWave's mobile customer-support assistant. Answers subscriber questions about "
+        "plan pricing and data allowances, data overage charges, international roaming, "
+        "billing dates and late-payment fees, SIM and eSIM replacement, contract length and "
+        "early cancellation, network coverage, and device upgrade eligibility."
+    ),
 }
 # Internal identifier of the sample RAG agent — matches its /health "service" value and
 # its key in mapping.yaml.

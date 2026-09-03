@@ -1,12 +1,20 @@
-"""/runs API — launch crash-test runs (one agent or many in parallel) and poll them."""
-import asyncio
+"""/runs API — launch crash-test runs (one agent or many in parallel) and poll them.
+
+Execution belongs to Temporal. These endpoints do three things and stop: validate the
+request, write the run rows so the client immediately has ids to poll, and submit one
+RunGroupWorkflow. They never wait for a run — progress is read back from PostgreSQL by
+GET /runs/group/{id}, which is why none of this is visible to the frontend.
+"""
 import json
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.core.orchestrator import prepare_scenarios, start_run_group
+from app.config import AGENT_CONCURRENCY, TEMPORAL_TASK_QUEUE, WORK_CONCURRENCY
+from app.core.activities import prepare_scenarios
 from app.core.scenarios import normalize_scenarios
+from app.temporal.client import get_client
+from app.temporal.workflows import AgentTestInput, RunGroupInput, RunGroupWorkflow
 from app.db import (
     build_conversation_payload,
     default_customer_agent,
@@ -20,20 +28,10 @@ from app.db import (
     replace_test_cases,
     run_counts,
     run_group_exists,
+    update_run,
 )
 
 router = APIRouter(prefix="/runs", tags=["runs"])
-
-# Background runs are fire-and-forget, but asyncio only holds a weak reference to a task.
-# Without a strong reference here the event loop can garbage-collect a run mid-flight —
-# which shows up as a run that silently stops progressing. Tasks remove themselves.
-_BACKGROUND: set[asyncio.Task] = set()
-
-
-def _launch(coro) -> None:
-    task = asyncio.create_task(coro)
-    _BACKGROUND.add(task)
-    task.add_done_callback(_BACKGROUND.discard)
 
 
 class GenerateScenarios(BaseModel):
@@ -75,6 +73,12 @@ class CreateRunGroup(BaseModel):
     tests: list[str] = []
     guidance: str = ""
     knowledge: str = ""
+
+
+def _group_workflow_id(group_id: int) -> str:
+    """The Temporal workflow id for a batch. Derived from group_id, so re-submitting the
+    same batch cannot start a second copy of it."""
+    return f"agentshield-run-group-{group_id}"
 
 
 def _normalize_reviewed(scenarios: list[dict]) -> tuple[list[dict], list[str]]:
@@ -149,13 +153,18 @@ async def generate_one_scenario(body: GenerateOne) -> dict:
     return {"scenario": match}
 
 
-def _launch_group(
+async def _launch_group(
     targets: list[RunTarget], tests: list[str], guidance: str, knowledge: str
 ) -> dict:
-    """Validate + persist every target, insert one run each, then run the batch.
+    """Validate + persist every target, insert one run each, then submit the workflow.
 
     All validation happens before any run row is inserted, so a bad target rejects the
     whole request instead of leaving half a batch running.
+
+    Submission is fire-and-forget by design: `start_workflow` returns as soon as Temporal
+    has durably recorded the workflow, so the HTTP response is not held for the length of
+    a run. From that moment Temporal owns execution — the run survives this process being
+    restarted, which the old asyncio background task did not.
     """
     if not targets:
         raise HTTPException(status_code=400, detail="no agents were selected")
@@ -172,9 +181,17 @@ def _launch_group(
             )
         prepared.append((t, reviewed, sources))
 
+    # Each run's fair slice of the worker's activity pool. Divided by how many children
+    # will actually be in flight — that is capped by AGENT_CONCURRENCY, so five selected
+    # agents still only split the pool three ways. Without this the pool is claimed
+    # first-come-first-served and whichever child schedules first takes every slot, which
+    # makes "parallel" agents run one after another.
+    concurrent_children = max(1, min(len(prepared), AGENT_CONCURRENCY))
+    work_share = max(1, WORK_CONCURRENCY // concurrent_children)
+
     group_id = insert_run_group()
     launched: list[dict] = []
-    orchestrator_targets: list[dict] = []
+    workflow_targets: list[AgentTestInput] = []
     for t, reviewed, sources in prepared:
         # Persist exactly what is about to run, against its customer-agent combination.
         if reviewed:
@@ -185,19 +202,50 @@ def _launch_group(
             "agent_id": t.agent_id,
             "customer_agent_id": t.customer_agent_id,
         })
-        orchestrator_targets.append({
-            "run_id": run_id, "agent_id": t.agent_id, "scenarios": reviewed,
-        })
+        workflow_targets.append(AgentTestInput(
+            run_id=run_id,
+            agent_id=t.agent_id,
+            selected_types=tests,
+            guidance=guidance,
+            knowledge=knowledge,
+            scenarios=reviewed or None,
+            work_share=work_share,
+        ))
 
-    # Fire-and-forget; the batch progresses while the client polls GET /runs/group/{id}.
-    _launch(start_run_group(orchestrator_targets, tests, guidance, knowledge))
+    try:
+        client = await get_client()
+        await client.start_workflow(
+            RunGroupWorkflow.run,
+            RunGroupInput(
+                group_id=group_id,
+                targets=workflow_targets,
+                # The configured limit is passed in rather than read inside the workflow:
+                # a workflow must replay identically, and an env var can change under it.
+                agent_concurrency=AGENT_CONCURRENCY,
+            ),
+            id=_group_workflow_id(group_id),
+            task_queue=TEMPORAL_TASK_QUEUE,
+        )
+    except Exception as e:
+        # The rows exist but nothing will ever execute them, so mark them errored rather
+        # than leaving the client polling a batch that is permanently stuck in "running".
+        for entry in launched:
+            update_run(entry["run_id"], status="error", finished=True)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "could not reach the Temporal server, so the run was not started "
+                f"({type(e).__name__}). Start it with: temporal server start-dev"
+            ),
+        ) from e
+
     return {"group_id": group_id, "runs": launched}
 
 
 @router.post("/group")
 async def create_run_group(body: CreateRunGroup) -> dict:
     """Crash-test every selected agent in parallel — one run each, one group over them."""
-    return _launch_group(body.targets, body.tests, body.guidance, body.knowledge)
+    return await _launch_group(body.targets, body.tests, body.guidance, body.knowledge)
 
 
 @router.post("")
@@ -208,7 +256,7 @@ async def create_run(body: CreateRun) -> dict:
         customer_agent_id=body.customer_agent_id,
         scenarios=body.scenarios,
     )
-    result = _launch_group([target], body.tests, body.guidance, body.knowledge)
+    result = await _launch_group([target], body.tests, body.guidance, body.knowledge)
     return {"run_id": result["runs"][0]["run_id"], "group_id": result["group_id"]}
 
 
