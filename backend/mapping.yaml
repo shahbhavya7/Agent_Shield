@@ -14,5 +14,7 @@ agents:
   insurance_bot: "SafeGuard Claims"
   # backend/sample_agents/airline.py
   airline_bot: "SkyRoute Airways Support"
+  # backend/sample_agents/telecom.py
+  telecom_bot: "ConnectWave Mobile Support"
   # backend/sample_rag_bot/main.py -> FastAPI(title=...); also the seeded `agents` row name.
   sample_rag_bot: "Store Customer-Support Agent (RAG)"

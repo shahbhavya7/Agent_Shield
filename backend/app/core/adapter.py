@@ -51,6 +51,12 @@ SAMPLE_AGENT_DESCRIPTIONS: dict[str, str] = {
         "and refund rules, check-in and gate cut-off times, seat selection charges, the "
         "SkyMiles loyalty programme, and delay compensation."
     ),
+    "telecom_bot": (
+        "ConnectWave's mobile customer-support assistant. Answers subscriber questions about "
+        "plan pricing and data allowances, data overage charges, international roaming, "
+        "billing dates and late-payment fees, SIM and eSIM replacement, contract length and "
+        "early cancellation, network coverage, and device upgrade eligibility."
+    ),
 }
 # Internal identifier of the sample RAG agent — matches its /health "service" value and
 # its key in mapping.yaml.

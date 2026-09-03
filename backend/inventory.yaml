@@ -17,6 +17,7 @@ customers:
     agents:
       - banking_bot     # NorthBank Support
       - insurance_bot   # SafeGuard Claims
+      - telecom_bot     # ConnectWave Mobile Support
 
   - name: Customer 3
     agents:

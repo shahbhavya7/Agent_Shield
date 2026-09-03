@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AgentShield — start everything with one command.
 #   ./run_all.sh
-# Starts: backend (8000), 5 sample agents (8002-8006), and the frontend (3000).
+# Starts: backend (8000), 6 sample agents (8002-8007), and the frontend (3000).
 # Ctrl-C stops them all.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +16,7 @@ cleanup() {
   echo "Stopping AgentShield…"
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
   # free the ports in case anything lingers
-  for p in 8000 8002 8003 8004 8005 8006 3000 7233 8233; do lsof -ti:$p | xargs kill 2>/dev/null; done
+  for p in 8000 8002 8003 8004 8005 8006 8007 3000 7233 8233; do lsof -ti:$p | xargs kill 2>/dev/null; done
   exit 0
 }
 trap cleanup INT TERM
@@ -43,6 +43,7 @@ start_agent "NorthBank (banking) agent"      "sample_agents.banking:app"    8003
 start_agent "PeopleDesk (HR) agent"          "sample_agents.hr:app"         8004
 start_agent "SafeGuard (insurance) agent"    "sample_agents.insurance:app"  8005
 start_agent "SkyRoute (airline) agent"       "sample_agents.airline:app"    8006
+start_agent "ConnectWave (telecom) agent"    "sample_agents.telecom:app"    8007
 
 # --- Temporal (optional) -----------------------------------------------------
 # Durable workflow execution. Nothing in the app depends on it yet, so a machine without
@@ -78,6 +79,7 @@ AgentShield is up:
   • PeopleDesk (HR):     http://localhost:8004/
   • SafeGuard (insurance): http://localhost:8005/
   • SkyRoute (airline):  http://localhost:8006/
+  • ConnectWave (telecom): http://localhost:8007/
 
 Temporal (workflow engine, not yet on the request path):
   • Web UI:              http://localhost:8233

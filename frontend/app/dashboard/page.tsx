@@ -386,7 +386,10 @@ export default function DashboardPage() {
 
   const plannedScenarios = suites.reduce((n, s) => n + s.length, 0);
 
-  const canVerify = agentName.trim().length > 0 && endpointUrl.trim().length > 0;
+  const canVerify =
+    agentName.trim().length > 0 &&
+    endpointUrl.trim().length > 0 &&
+    knowledgeText.trim().length > 0;
   const canGenerate = selectedTests.length > 0 && !generating;
   const canRunTest = plannedScenarios > 0 && !starting && !generating;
   const aiCount = testCases.filter((c) => c.source === "ai").length;
@@ -953,7 +956,7 @@ export default function DashboardPage() {
 
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">
-                      Agent knowledge <span className="text-slate-600">(optional — all three tiers below are optional)</span>
+                      Agent knowledge <span className="text-[#F87171]">(required)</span>
                     </label>
 
                     {/* Tier 1: upload docs */}
