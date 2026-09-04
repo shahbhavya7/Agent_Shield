@@ -1,0 +1,154 @@
+# AgentShield — Dockerized version of run_all.sh's process list, one container per
+# process, on one internal network. See docker/.env.example for the environment.
+#
+# Container-to-container traffic uses Docker service names (never localhost); the one
+# exception is NEXT_PUBLIC_API_URL, which is fetched from the browser and must stay a
+# host-reachable address.
+
+volumes:
+  pgdata:
+
+networks:
+  agentshield-net:
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    env_file:
+      - docker/.env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - agentshield-net
+
+  # Temporal dev server — same `server start-dev` run_all.sh already runs, bound to
+  # 0.0.0.0 so other containers can reach it as `temporal:7233`. Ephemeral state, matching
+  # today's behavior (the dev server keeps history in memory only either way).
+  temporal:
+    image: temporalio/temporal:latest
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--log-level", "warn"]
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    networks:
+      - agentshield-net
+
+  backend:
+    build:
+      context: ./backend
+    image: agentshield-backend:local
+    env_file:
+      - docker/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    networks:
+      - agentshield-net
+
+  worker:
+    build:
+      context: ./backend
+    image: agentshield-backend:local
+    command: ["python", "-m", "app.temporal.worker"]
+    env_file:
+      - docker/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    networks:
+      - agentshield-net
+
+  sample-rag-bot:
+    build:
+      context: ./backend
+    image: agentshield-backend:local
+    command: ["uvicorn", "sample_rag_bot.main:app", "--host", "0.0.0.0", "--port", "8002"]
+    env_file:
+      - docker/.env
+    ports:
+      - "8002:8002"
+    networks:
+      - agentshield-net
+
+  banking-bot:
+    build:
+      context: ./backend
+    image: agentshield-backend:local
+    command: ["uvicorn", "sample_agents.banking:app", "--host", "0.0.0.0", "--port", "8003"]
+    env_file:
+      - docker/.env
+    ports:
+      - "8003:8003"
+    networks:
+      - agentshield-net
+
+  hr-bot:
+    build:
+      context: ./backend
+    image: agentshield-backend:local
+    command: ["uvicorn", "sample_agents.hr:app", "--host", "0.0.0.0", "--port", "8004"]
+    env_file:
+      - docker/.env
+    ports:
+      - "8004:8004"
+    networks:
+      - agentshield-net
+
+  insurance-bot:
+    build:
+      context: ./backend
+    image: agentshield-backend:local
+    command: ["uvicorn", "sample_agents.insurance:app", "--host", "0.0.0.0", "--port", "8005"]
+    env_file:
+      - docker/.env
+    ports:
+      - "8005:8005"
+    networks:
+      - agentshield-net
+
+  airline-bot:
+    build:
+      context: ./backend
+    image: agentshield-backend:local
+    command: ["uvicorn", "sample_agents.airline:app", "--host", "0.0.0.0", "--port", "8006"]
+    env_file:
+      - docker/.env
+    ports:
+      - "8006:8006"
+    networks:
+      - agentshield-net
+
+  telecom-bot:
+    build:
+      context: ./backend
+    image: agentshield-backend:local
+    command: ["uvicorn", "sample_agents.telecom:app", "--host", "0.0.0.0", "--port", "8007"]
+    env_file:
+      - docker/.env
+    ports:
+      - "8007:8007"
+    networks:
+      - agentshield-net
+
+  frontend:
+    build:
+      context: ./frontend
+    image: agentshield-frontend:local
+    env_file:
+      - docker/.env
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    networks:
+      - agentshield-net
