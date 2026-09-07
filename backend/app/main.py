@@ -1,6 +1,6 @@
 """AgentShield backend entrypoint: FastAPI app + CORS + /health.
 
-Routers are included as later phases add them (currently none).
+Mounts the runs/agents/conversations/inventory routers below.
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

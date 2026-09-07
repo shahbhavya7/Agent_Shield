@@ -5,12 +5,13 @@ yourself**, and **the current end-to-end flow** in detail so anyone can understa
 system as it stands.
 
 > Status: **Phases 1–4 (the original hackathon MVP) are complete but partly superseded.**
-> Phases 5–8 below replaced SQLite with PostgreSQL, moved run execution onto Temporal,
-> added the customer/test-case data model behind the two-flow UI (Connect a new agent vs.
-> reuse an existing one), and hardened the Judge and scoring for run-to-run consistency.
-> Read phases 1–4 as history — what launched the product — and 5–8 as what it evolved
-> into. Where a later phase changed something a numbered callout (**⚠ Phase N**) marks it
-> inline rather than silently rewriting the record.
+> Phases 5–8 replaced SQLite with PostgreSQL, moved run execution onto Temporal, added the
+> customer/test-case data model behind the two-flow UI (Connect a new agent vs. reuse an
+> existing one), and hardened the Judge and scoring for run-to-run consistency. Phase 9
+> added a containerized (Docker Compose) way to run that same stack. Read phases 1–4 as
+> history — what launched the product — and 5–9 as what it evolved into. Where a later
+> phase changed something a numbered callout (**⚠ Phase N**) marks it inline rather than
+> silently rewriting the record.
 
 ---
 
@@ -42,10 +43,12 @@ Connect agent → Verify connection → Agent knowledge → Generate test cases
 | 6 | Durable, Parallel Execution | Temporal workflows replace the background asyncio task | ✅ done |
 | 7 | Reliability Hardening | Deterministic judge, derived severity, honest error states | ✅ done |
 | 8 | Sample Agent Roster | 6 domains as deliberate pass/fail archetypes | ✅ done |
+| 9 | Containerization | Docker Compose stack — same services, one container each | ✅ done |
 
 **Current stack:** FastAPI + **PostgreSQL** + asyncio + **Temporal** (backend), **Next.js**
 + TypeScript (frontend), OpenAI (LLM, isolated in `app/core/llm.py`). Still no
-Docker/auth/Redis/Celery/websockets.
+auth/Redis/Celery/websockets. Runs either natively (`run_all.sh`) or containerized
+(`docker compose up`, added in Phase 9) — same stack either way.
 
 ---
 
@@ -831,3 +834,44 @@ curl -X POST http://localhost:8007/chat -H 'content-type: application/json' \
 ### What you have after Phase 8
 - Six sample agents instead of four, each a clean single-dimension test case for one
   failure mode rather than a uniform "good agent"/"bad agent" split.
+
+---
+
+## PHASE 9 — Containerization ✅
+
+`run_all.sh` still works exactly as before; this phase added a second, containerized way to
+run the identical stack, for anyone who'd rather not install Postgres/Temporal/Python/Node
+locally.
+
+### What we built
+- `docker-compose.yml` (repo root) — one container per `run_all.sh` process, on one internal
+  bridge network (`agentshield-net`): `postgres` (16-alpine, with a healthcheck other
+  services wait on), `temporal` (the same `server start-dev` run_all.sh already runs, bound
+  to `0.0.0.0` so other containers can reach it as `temporal:7233`), `backend`, `worker`
+  (same image as backend, different command), one container each for the 6 sample agents
+  (`sample-rag-bot`, `banking-bot`, `hr-bot`, `insurance-bot`, `airline-bot`, `telecom-bot`),
+  and `frontend`. Same published ports as the native run (`3000`, `8000`, `7233`/`8233`,
+  `8002`–`8007`).
+- `backend/Dockerfile` + `backend/.dockerignore` — one image, reused by `backend`, `worker`,
+  and every sample-agent service via a different `command:`.
+- `frontend/Dockerfile` + `frontend/.dockerignore` — the Next.js app.
+- `docker/.env.example` — a Docker-only env template, **deliberately separate** from
+  `backend/.env`: every container-to-container URL uses a Docker Compose **service name**
+  (`postgres`, `temporal`, `sample-rag-bot`, …), never `localhost`, because containers can't
+  reach each other that way. The one exception is `NEXT_PUBLIC_API_URL` — fetched from the
+  **browser**, not from inside a container, so it stays a host-reachable address
+  (`http://localhost:8000`) even in the Docker env file.
+
+### How to test Phase 9 yourself
+```bash
+cp docker/.env.example docker/.env    # paste your OPENAI_API_KEY
+docker compose up --build
+# open http://localhost:3000 — same app as ./run_all.sh, now fully containerized
+docker compose down                   # stop everything; add -v to also drop the pgdata volume
+```
+
+### What you have after Phase 9
+- The exact same product, runnable with one command and no local Postgres/Temporal/
+  Python/Node install: `docker compose up`.
+- `run_all.sh` (native) and `docker compose up` (containerized) as two independent, equally
+  supported ways to run the stack — neither is the "real" one.

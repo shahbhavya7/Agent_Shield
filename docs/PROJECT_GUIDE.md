@@ -437,8 +437,9 @@ reused across as many runs as you like.
 | Frontend | Next.js + Tailwind + framer-motion | modern, animated UI, App Router |
 | Agents under test | 6 standalone RAG agents + gpt-4o-mini | real, non-deterministic agents, each a deliberate pass/fail archetype, so results are credible |
 
-Still deliberately **no** Docker / auth / Redis / Celery / websockets — those weren't
-needed even once Postgres and Temporal were added.
+Still deliberately **no** auth / Redis / Celery / websockets — those weren't needed even
+once Postgres and Temporal were added. **Docker** was added later (§11) purely as a second,
+containerized way to run the same stack — it didn't change any of the above.
 
 ---
 
@@ -458,6 +459,24 @@ connected).
 
 A run genuinely requires the Temporal server to be reachable — without it, `POST /runs`
 returns HTTP 503 rather than silently doing nothing.
+
+### Running it containerized instead
+
+```bash
+cp docker/.env.example docker/.env    # then paste your key into OPENAI_API_KEY=
+docker compose up --build
+```
+
+`docker-compose.yml` (repo root) is a one-container-per-process mirror of `run_all.sh`'s
+process list: `postgres`, `temporal`, `backend`, `worker`, one container per sample agent
+(`sample-rag-bot`, `banking-bot`, `hr-bot`, `insurance-bot`, `airline-bot`, `telecom-bot`),
+and `frontend` — same ports as the native run, on one internal bridge network
+(`agentshield-net`). `docker/.env` is deliberately separate from `backend/.env`: every
+container-to-container URL in it uses a Docker **service name** (e.g.
+`postgresql://agentshield:agentshield@postgres:5432/agentshield`,
+`TEMPORAL_ADDRESS=temporal:7233`), never `localhost` — the one exception is
+`NEXT_PUBLIC_API_URL`, which the **browser** fetches, so it stays a host-reachable address
+even inside `docker/.env`. Neither `.env` file is meant to be merged into the other.
 
 ---
 
@@ -569,7 +588,7 @@ per-customer test-case libraries, run batches) with concurrent runs. An `asyncio
 background task dies with the process and has no fair way to share concurrency across
 several agents running "in parallel" — Temporal makes a run durable (survives a restart)
 and genuinely shares a concurrency budget across a batch. Still deliberately no
-Docker/auth/Redis/Celery/websockets — those weren't the actual gap.
+auth/Redis/Celery/websockets — those weren't the actual gap.
 
 **Q: What's the single most important thing to remember?**
 A: **We don't just tell you the agent failed — we tell you exactly what was asked, how it

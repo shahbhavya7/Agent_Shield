@@ -76,6 +76,24 @@ cd backend
 cd frontend && npm run dev                               # :3000
 ```
 
+## Or run it containerized
+
+```bash
+cp docker/.env.example docker/.env      # then paste your key into OPENAI_API_KEY=
+docker compose up --build
+```
+
+One command, no local Postgres/Temporal/Python/Node install needed. `docker-compose.yml`
+starts the same stack as `run_all.sh` — one container per process: `postgres`, `temporal`,
+`backend`, `worker`, all 6 sample agents, `frontend` — on the same ports (`3000`, `8000`,
+`7233`/`8233`, `8002`–`8007`), on one internal network. `docker compose down` stops it
+(add `-v` to also drop the Postgres volume).
+
+`docker/.env` is a separate template from `backend/.env` — container-to-container URLs in
+it use Docker service names (`postgres`, `temporal:7233`, …), never `localhost`; the one
+exception is `NEXT_PUBLIC_API_URL`, fetched from the browser, which stays
+`http://localhost:8000` even there.
+
 ## The two ways to test an agent
 - **Connect Your AI Agent** (`/dashboard`) — point AgentShield at a brand-new endpoint: name,
   URL, optional auth header, then **Agent Knowledge** (required — upload a docs file or type a
