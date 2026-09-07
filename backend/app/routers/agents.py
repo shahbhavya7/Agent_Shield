@@ -22,6 +22,9 @@ class RegisterAgent(BaseModel):
     request_template: str = DEFAULT_REQUEST_TEMPLATE
     auth_header: str | None = None
     description: str | None = None
+    # "chat" (default, text/HTTP) or "voice" — which execution path the Temporal
+    # workflow uses for runs against this agent.
+    modality: str = "chat"
 
 
 class AgentKnowledge(BaseModel):
@@ -34,6 +37,7 @@ def _row_to_dict(row) -> dict:
     r = dict(row)
     return {
         "id": r["id"], "name": r["name"], "kind": r["kind"],
+        "modality": r.get("modality") or "chat",
         "endpoint_url": r["endpoint_url"], "response_path": r["response_path"],
         "description": r["description"], "created_at": r["created_at"],
         "knowledge_name": r.get("knowledge_name"),
@@ -75,6 +79,7 @@ def register(body: RegisterAgent) -> dict:
         request_template=body.request_template,
         auth_header=body.auth_header,
         description=body.description,
+        modality=body.modality,
     )
     return {"agent_id": agent_id}
 

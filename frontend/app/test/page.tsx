@@ -2,10 +2,7 @@
 
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { useEffect, useState } from "react";
-import { ArrowRight, MessageSquare, Mic, ShieldCheck, UploadCloud, ListChecks } from "lucide-react";
-
-type Modality = "chat" | "voice";
+import { ArrowRight, MessageSquare, Mic, ShieldCheck } from "lucide-react";
 
 const shapes = [
   { size: 190, top: "-6%", left: "-4%", color: "#7C5CFF", radius: "42% 58% 70% 30% / 45% 45% 55% 55%", rotate: 10, duration: 20, delay: 0 },
@@ -14,37 +11,28 @@ const shapes = [
   { size: 90, top: "55%", left: "72%", color: "#FBBF24", radius: "73% 27% 45% 55% / 39% 49% 51% 61%", rotate: -14, duration: 13, delay: 1.5 },
 ];
 
-// `href`s are appended with `?modality=` once we know it, so the choice made on
-// /test rides along into /dashboard and /existing-agent without a global store.
-const options = [
+// Which kind of agent to crash-test. Carried forward as ?modality=chat|voice through
+// /start and /existing-agent into /dashboard, which drives the whole run off it.
+const modalities = [
   {
-    href: "/dashboard",
-    icon: UploadCloud,
-    title: "Start New Agent Test",
+    href: "/start?modality=chat",
+    icon: MessageSquare,
+    title: "Chat Agent",
     description:
-      "Connect an agent that hasn't been set up yet. You'll point AgentShield at its endpoint, then generate and run tests.",
-    cta: "Connect a new agent",
+      "Test conversational AI through text — connect a chat/API endpoint and crash-test it with generated scenarios.",
+    cta: "Test Chat Agent",
   },
   {
-    href: "/existing-agent",
-    icon: ListChecks,
-    title: "Test Existing Agent",
+    href: "/start?modality=voice",
+    icon: Mic,
+    title: "Voice Agent",
     description:
-      "Pick a customer and one of their already-registered agents, and run a fresh test against it.",
-    cta: "Choose an existing agent",
+      "Test conversational AI through voice — an AI caller talks to your voice agent's endpoint and the conversation is judged from the transcript.",
+    cta: "Test Voice Agent",
   },
 ];
 
-export default function StartTesting() {
-  // Defaults to "chat" so a direct/bookmarked /start link (no modality chosen) behaves
-  // exactly as it always has.
-  const [modality, setModality] = useState<Modality>("chat");
-
-  useEffect(() => {
-    const q = new URLSearchParams(window.location.search).get("modality");
-    if (q === "voice" || q === "chat") setModality(q);
-  }, []);
-
+export default function ChooseModality() {
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#0B0B0F]">
       {shapes.map((shape, index) => (
@@ -77,13 +65,6 @@ export default function StartTesting() {
             </div>
             <span className="font-logo text-lg font-extrabold tracking-tight text-[#F8FAFC]">AgentShield</span>
           </Link>
-          <Link
-            href="/test"
-            className="flex items-center gap-2 rounded-full border border-white/12 bg-white/2 px-5 py-2.5 text-sm font-medium text-[#F8FAFC] backdrop-blur-md transition-all duration-300 hover:border-white/[0.16] hover:bg-white/4"
-          >
-            {modality === "voice" ? <Mic className="h-4 w-4" strokeWidth={1.5} /> : <MessageSquare className="h-4 w-4" strokeWidth={1.5} />}
-            Change
-          </Link>
         </div>
       </header>
 
@@ -94,20 +75,16 @@ export default function StartTesting() {
           transition={{ duration: 0.5, ease: "easeOut" }}
           className="text-center"
         >
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/12 bg-white/2 px-4 py-1.5 text-sm font-medium text-[#9CA3AF] backdrop-blur-md">
-            {modality === "voice" ? <Mic className="h-3.5 w-3.5" strokeWidth={1.5} /> : <MessageSquare className="h-3.5 w-3.5" strokeWidth={1.5} />}
-            Testing: {modality === "voice" ? "Voice Agent" : "Chat Agent"}
-          </span>
-          <h1 className="font-heading mt-6 text-3xl font-medium tracking-tight text-[#F8FAFC] sm:text-4xl">
-            How do you want to start?
+          <h1 className="font-heading text-3xl font-medium tracking-tight text-[#F8FAFC] sm:text-4xl">
+            What would you like to test?
           </h1>
           <p className="mt-4 text-base text-[#9CA3AF]">
-            Test a brand-new agent, or run a fresh test against one you&apos;ve already registered.
+            AgentShield crash-tests both modalities the same way — pick how your agent talks to users.
           </p>
         </motion.div>
 
         <div className="mt-12 grid grid-cols-1 gap-6 sm:grid-cols-2">
-          {options.map((option, index) => (
+          {modalities.map((option, index) => (
             <motion.div
               key={option.title}
               initial={{ opacity: 0, y: 24 }}
@@ -116,7 +93,7 @@ export default function StartTesting() {
               whileHover={{ y: -6 }}
             >
               <Link
-                href={`${option.href}?modality=${modality}`}
+                href={option.href}
                 className="flex h-full flex-col rounded-xl border border-white/12 bg-white/2 p-8 shadow-[0_8px_40px_rgba(0,0,0,0.35)] backdrop-blur-md transition-all duration-300 hover:border-white/30 hover:bg-white/4"
               >
                 <div className="flex h-12 w-12 items-center justify-center rounded-lg border border-white/20 bg-white/4 text-slate-200">

@@ -40,6 +40,8 @@ import {
   Trash2,
   Wand2,
   Save,
+  MessageSquare,
+  Mic,
 } from "lucide-react";
 import {
   createRunGroup,
@@ -274,7 +276,13 @@ export default function DashboardPage() {
   const router = useRouter();
   const [step, setStep] = useState<Step>("connect");
 
-  // Prefilled to our sample RAG agent so the demo is one click.
+  // Which kind of agent this run is testing — carried in from /test via
+  // /start?modality=... (and from there into /existing-agent and here). Defaults to
+  // "chat" so every existing entry point that doesn't pass it behaves exactly as before.
+  const [modality, setModality] = useState<"chat" | "voice">("chat");
+
+  // Prefilled to our sample RAG agent so the chat demo is one click. Left blank for
+  // voice, since there's no sample voice agent wired up yet.
   const [agentName, setAgentName] = useState("Store Support Agent (RAG)");
   const [endpointUrl, setEndpointUrl] = useState("http://localhost:8002/chat");
   const [apiKey, setApiKey] = useState("");
@@ -400,7 +408,7 @@ export default function DashboardPage() {
 
   // "Run New Test" sends the user back to the start choice (new agent vs existing agent).
   const handleReset = () => {
-    router.push("/start");
+    router.push(`/start?modality=${modality}`);
     setTargets([]);
     setActiveIdx(0);
     setStep("connect");
@@ -426,6 +434,20 @@ export default function DashboardPage() {
     setSaving(false);
     setSavedNote(null);
   };
+
+  // --- Modality: which kind of agent this run tests ---
+  // Read once on mount, same "manual window.location.search" convention as the target
+  // parsing below (kept separate from it since modality applies on every entry path,
+  // including "connect a new agent", where the targets effect returns early).
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("modality");
+    if (q !== "voice") return;
+    setModality("voice");
+    // The chat defaults point at our sample RAG bot, which only speaks text — clear
+    // them rather than prefill a voice run with an endpoint that can't work.
+    setAgentName("");
+    setEndpointUrl("");
+  }, []);
 
   // --- Existing Agent Testing entry ---
   // ?targets=<json list of {ca,agent,customer,agentName}> for one or many agents, or the
@@ -519,6 +541,7 @@ export default function DashboardPage() {
         response_path: "reply",
         auth_header: auth,
         description: aboutText.trim() || undefined,
+        modality,
       });
       setAgentId(agent_id);
       // Store the uploaded docs on the agent so every later run stays grounded on them.
@@ -874,6 +897,10 @@ export default function DashboardPage() {
               <ShieldCheck className="h-5 w-5" strokeWidth={1.5} />
             </div>
             <span className="font-logo text-lg font-extrabold tracking-tight text-[#F8FAFC]">AgentShield</span>
+            <span className="ml-2 hidden items-center gap-1.5 rounded-full border border-white/12 bg-white/2 px-3 py-1 text-xs font-medium text-[#9CA3AF] sm:inline-flex">
+              {modality === "voice" ? <Mic className="h-3 w-3" strokeWidth={1.5} /> : <MessageSquare className="h-3 w-3" strokeWidth={1.5} />}
+              {modality === "voice" ? "Voice Agent" : "Chat Agent"}
+            </span>
           </Link>
 
           {step === "results" ? (
@@ -924,9 +951,13 @@ export default function DashboardPage() {
           {step === "connect" && (
             <motion.section key="connect" {...fadeStep} className="mt-10 flex justify-center">
               <div className="w-full max-w-2xl rounded-xl border border-white/12 bg-white/2 p-10 backdrop-blur-md">
-                <h2 className="font-heading text-2xl font-medium text-[#F8FAFC]">Connect Your AI Agent</h2>
+                <h2 className="font-heading text-2xl font-medium text-[#F8FAFC]">
+                  {modality === "voice" ? "Connect Your Voice Agent" : "Connect Your AI Agent"}
+                </h2>
                 <p className="mt-2 text-sm text-[#9CA3AF]">
-                  Point AgentShield at any agent&apos;s HTTP endpoint. (Prefilled with our sample RAG agent.)
+                  {modality === "voice"
+                    ? "Point AgentShield at your voice agent's HTTP endpoint. Running it locally? Expose it with a tunnel like ngrok and paste the public URL below."
+                    : "Point AgentShield at any agent's HTTP endpoint. (Prefilled with our sample RAG agent.)"}
                 </p>
 
                 <div className="mt-8 flex flex-col gap-5">
@@ -939,10 +970,17 @@ export default function DashboardPage() {
                   </div>
 
                   <div>
-                    <label className="text-xs font-medium text-[#9CA3AF]">Endpoint URL</label>
+                    <label className="text-xs font-medium text-[#9CA3AF]">
+                      {modality === "voice" ? "Voice Agent Endpoint URL" : "Endpoint URL"}
+                    </label>
                     <div className="mt-2 flex items-center gap-3 rounded-lg border border-white/12 bg-white/2 px-4 py-3 transition-colors duration-300 focus-within:border-white/30">
                       <Link2 className="h-4 w-4 shrink-0 text-slate-400" strokeWidth={1.5} />
-                      <input value={endpointUrl} onChange={(e) => setEndpointUrl(e.target.value)} placeholder="https://api.example.com/v1/agent" className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600" />
+                      <input
+                        value={endpointUrl}
+                        onChange={(e) => setEndpointUrl(e.target.value)}
+                        placeholder={modality === "voice" ? "https://<your-ngrok-subdomain>.ngrok.io/voice-chat" : "https://api.example.com/v1/agent"}
+                        className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600"
+                      />
                     </div>
                   </div>
 

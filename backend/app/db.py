@@ -137,6 +137,10 @@ def init_schema() -> None:
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge TEXT;
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge_name TEXT;
 
+        -- Which testing modality this agent is: chat (default, text/HTTP) or voice.
+        -- The Temporal workflow reads this to pick play_scenario vs play_voice_scenario.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS modality TEXT NOT NULL DEFAULT 'chat';
+
         -- Idempotency, so a re-executed unit of work converges on the same rows instead
         -- of appending new ones. This is the precondition for turning on retries.
         --
@@ -193,15 +197,16 @@ def insert_agent(
     request_template: str,
     auth_header: str | None = None,
     description: str | None = None,
+    modality: str = "chat",
 ) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO agents
            (name, kind, endpoint_url, auth_header, request_template,
-            response_path, description, created_at)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            response_path, description, created_at, modality)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (name, kind, endpoint_url, auth_header, request_template,
-         response_path, description, now_iso()),
+         response_path, description, now_iso(), modality),
     )
     agent_id = cur.fetchone()["id"]
     conn.commit()
@@ -638,11 +643,11 @@ def get_or_create_customer_agent(customer_id: int, agent_id: int) -> int:
 
 
 def list_customer_agents() -> list[dict]:
-    """Every customer-agent combination, with the customer and agent names joined in."""
+    """Every customer-agent combination, with the customer, agent names, and modality joined in."""
     conn = get_conn()
     rows = conn.execute(
         """SELECT ca.id, ca.customer_id, ca.agent_id,
-                  c.name AS customer_name, a.name AS agent_name
+                  c.name AS customer_name, a.name AS agent_name, a.modality AS agent_modality
            FROM customer_agents ca
            JOIN customers c ON c.id = ca.customer_id
            JOIN agents a    ON a.id = ca.agent_id
@@ -671,11 +676,11 @@ def insert_test_case(customer_agent_id: int, tc: dict, source: str = "ai") -> in
 
 
 def get_customer_agent(customer_agent_id: int) -> dict | None:
-    """One customer-agent combination with the customer and agent names joined in."""
+    """One customer-agent combination with the customer, agent names, and modality joined in."""
     conn = get_conn()
     row = conn.execute(
         """SELECT ca.id, ca.customer_id, ca.agent_id,
-                  c.name AS customer_name, a.name AS agent_name
+                  c.name AS customer_name, a.name AS agent_name, a.modality AS agent_modality
            FROM customer_agents ca
            JOIN customers c ON c.id = ca.customer_id
            JOIN agents a    ON a.id = ca.agent_id

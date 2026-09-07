@@ -25,6 +25,7 @@ export interface Agent {
   id: number;
   name: string;
   kind: string;
+  modality?: "chat" | "voice";
   endpoint_url: string;
   response_path: string;
   description?: string | null;
@@ -161,6 +162,7 @@ export interface InventoryAgent {
   name: string;
   customer_agent_id: number | null;
   agent_id: number | null;
+  modality: "chat" | "voice";
 }
 
 export interface InventoryCustomer {
@@ -180,6 +182,8 @@ export function registerAgent(body: {
   request_template?: string;
   auth_header?: string | null;
   description?: string | null;
+  // "chat" (default) or "voice" — which execution path the Temporal workflow uses.
+  modality?: "chat" | "voice";
 }): Promise<{ agent_id: number }> {
   return req("/agents", { method: "POST", body: JSON.stringify(body) });
 }
