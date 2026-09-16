@@ -1,14 +1,21 @@
 """Async OpenAI wrapper, isolated so the LLM provider can be swapped later.
 
-Everything that talks to the model goes through chat(). Callers never import
-`openai` directly.
+Everything that talks to the model goes through chat() (text) or text_to_speech() /
+speech_to_text() (voice). Callers never import `openai` directly.
 """
+import io
 import json
 from typing import Any, Optional
 
 from openai import AsyncOpenAI
 
-from app.config import LLM_MODEL, OPENAI_API_KEY
+from app.config import (
+    LLM_MODEL,
+    OPENAI_API_KEY,
+    VOICE_STT_MODEL,
+    VOICE_TTS_MODEL,
+    VOICE_TTS_VOICE,
+)
 
 # Single shared async client. If the key is empty this still constructs; the
 # error only surfaces on an actual call, which is what we want for smoke tests.
@@ -75,3 +82,24 @@ async def chat(
                 raw = await _once()  # one retry
                 continue
             raise
+
+
+async def text_to_speech(text: str) -> bytes:
+    """TTS: text -> WAV audio bytes. Used only by app.core.voice_caller (the AI Caller)
+    to turn a scenario's text turn into speech before it reaches a voice-contract agent.
+    """
+    resp = await _client.audio.speech.create(
+        model=VOICE_TTS_MODEL, voice=VOICE_TTS_VOICE, input=text, response_format="wav",
+    )
+    return resp.content
+
+
+async def speech_to_text(audio_bytes: bytes) -> str:
+    """STT: WAV audio bytes -> text. Used only by app.core.voice_caller (the AI Caller)
+    to turn a voice agent's spoken reply back into the text the rest of AgentShield
+    (persistence, Judge, scoring) already knows how to handle.
+    """
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = "audio.wav"  # the SDK needs a filename to infer the audio format
+    result = await _client.audio.transcriptions.create(model=VOICE_STT_MODEL, file=audio_file)
+    return (result.text or "").strip()

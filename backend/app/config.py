@@ -62,6 +62,14 @@ WORKFLOW_TASK_CONCURRENCY: int = int(os.getenv("WORKFLOW_TASK_CONCURRENCY", "100
 # Default is a blended gpt-4o-mini rate; override per model via .env.
 PRICE_PER_1K_TOKENS: float = float(os.getenv("PRICE_PER_1K_TOKENS", "0.0004"))
 
+# --- Voice (Phase 2B: AI Caller) ---------------------------------------------
+# STT/TTS models app.core.voice_caller uses to bridge a text scenario turn onto a real
+# voice-contract endpoint. Same OpenAI vendor as every other model call in this app —
+# no new provider. Defaults match backend/sample_voice_bot's own defaults.
+VOICE_STT_MODEL: str = os.getenv("VOICE_STT_MODEL", "whisper-1")
+VOICE_TTS_MODEL: str = os.getenv("VOICE_TTS_MODEL", "tts-1")
+VOICE_TTS_VOICE: str = os.getenv("VOICE_TTS_VOICE", "alloy")
+
 # --- Agent name mapping (backend/mapping.yaml) -------------------------------
 # Maps the internal agent identifier used in the repo (Domain.key, or the module name
 # for the standalone sample_rag_bot) to the agent's actual / display name.

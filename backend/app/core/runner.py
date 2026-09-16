@@ -4,7 +4,7 @@ Plays one scenario against the agent turn-by-turn through the black-box adapter,
 injecting the scenario's assigned fault, doing a semi-adaptive follow-up for
 injection/memory scenarios, and recording every turn + trace to the DB.
 """
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
 
 from app.core.adapter import send
 from app.core.llm import chat
@@ -64,7 +64,11 @@ async def _adaptive_followup(scenario: dict, transcript: list[dict]) -> str | No
 
 
 async def run_scenario(
-    run_id: int, scenario: dict, agent: Any, idem_key: str | None = None
+    run_id: int,
+    scenario: dict,
+    agent: Any,
+    idem_key: str | None = None,
+    send_fn: Optional[Callable[..., Awaitable[dict]]] = None,
 ) -> int:
     """Play a scenario end-to-end. Returns the (unjudged) conversation id.
 
@@ -72,7 +76,16 @@ async def run_scenario(
     resolves to the same conversation, and its transcript is cleared first, so running
     this twice leaves exactly one conversation with one clean set of turns. Omit it
     (the default) when a NEW conversation is wanted — replay does that.
+
+    `send_fn` is which function actually plays one turn against the agent — same
+    signature/return shape as app.core.adapter.send() (``(agent, message, history,
+    faults) -> {"reply": str, "trace": dict}``). Defaults to `send` itself (the
+    existing chat behaviour, unchanged). The voice modality passes
+    app.core.voice_caller.call_voice_agent here instead — everything else in this
+    function (seed turns, adaptive follow-up, persistence, idempotency) is identical
+    for both modalities; only how one turn reaches the agent differs.
     """
+    send_fn = send_fn or send
     scenario_id = scenario["_id"]
     conv_id = get_or_create_conversation(run_id, scenario_id, idem_key)
     # Reused conversation from an earlier attempt: drop its turns so this attempt writes
@@ -100,7 +113,7 @@ async def run_scenario(
         tester_turns_played += 1
 
         # --- agent turn (fault injected here) ---
-        result = await send(agent, tester_msg, history_for_agent, faults)
+        result = await send_fn(agent, tester_msg, history_for_agent, faults)
         reply, trace = result["reply"], result.get("trace", {})
         insert_message(conv_id, turn_index, "agent", reply, trace)
         transcript.append({"role": "agent", "content": reply})

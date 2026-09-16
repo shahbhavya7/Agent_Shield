@@ -38,6 +38,7 @@ from app.core.judge import _endpoint_never_responded, judge_conversation
 from app.core.runner import run_scenario
 from app.core.scenarios import generate_scenarios
 from app.core.scoring import compute
+from app.core.voice_caller import call_voice_agent
 from app.db import (
     get_agent,
     get_conversation,
@@ -118,6 +119,27 @@ async def play_scenario(run_id: int, scenario: dict, agent: dict) -> int:
     return await run_scenario(
         run_id, scenario, agent,
         idem_key=f"run:{run_id}:scenario:{scenario['_id']}",
+    )
+
+
+@activity.defn
+async def play_voice_scenario(run_id: int, scenario: dict, agent: dict) -> int:
+    """HTTP + TTS/STT + LLM + DB. Play one scenario against a voice-modality agent;
+    returns its conversation id.
+
+    Phase 2B: the scenario's text turns are bridged onto a real voice-contract
+    endpoint via app.core.voice_caller.call_voice_agent (the "AI Caller") — TTS the
+    tester's text, POST the resulting audio through the SAME black-box HTTP adapter
+    chat uses, STT the agent's spoken reply back to text. run_scenario() itself is
+    unchanged and fully reused: only which function plays a turn differs (`send_fn`),
+    so persistence, idempotency, and the adaptive follow-up all behave identically to
+    the chat path. The Judge, Scoring, and Fixer only ever see the resulting text —
+    they remain completely unaware anything was ever audio.
+    """
+    return await run_scenario(
+        run_id, scenario, agent,
+        idem_key=f"run:{run_id}:scenario:{scenario['_id']}:voice",
+        send_fn=call_voice_agent,
     )
 
 

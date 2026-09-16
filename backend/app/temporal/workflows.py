@@ -37,6 +37,7 @@ with workflow.unsafe.imports_passed_through():
         load_agent,
         persist_suite,
         play_scenario,
+        play_voice_scenario,
         prepare_scenarios,
     )
     from app.temporal.policies import options_for
@@ -165,12 +166,20 @@ class AgentTestWorkflow:
             # share only decides how much of it ONE run may hold, so sibling agents get
             # slots too. Shares of concurrently-running children sum to the ceiling, so
             # this divides the pool rather than multiplying it.
+            #
+            # Modality decides which activity plays the scenario — everything else about
+            # the six stages is identical. A "voice" agent is reached over the same
+            # black-box HTTP JSON contract as chat, but play_voice_scenario bridges each
+            # turn through TTS/STT (app.core.voice_caller) before/after that HTTP call
+            # (Phase 2B), so the Judge and every later stage still only ever see text.
+            # This is the only place voice testing diverges from the existing path.
+            play_fn = play_voice_scenario if agent.get("modality") == "voice" else play_scenario
             await _bounded_gather(
                 [
                     (lambda s=scenario: workflow.execute_activity(
-                        play_scenario,
+                        play_fn,
                         args=[inp.run_id, s, agent],
-                        **options_for(play_scenario),
+                        **options_for(play_fn),
                     ))
                     for scenario in suite
                 ],
