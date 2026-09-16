@@ -25,6 +25,9 @@ class RegisterAgent(BaseModel):
     # "chat" (default, text/HTTP) or "voice" — which execution path the Temporal
     # workflow uses for runs against this agent.
     modality: str = "chat"
+    # Which wire protocol a voice-modality agent speaks. Only "http_json" (the
+    # existing TTS -> HTTP -> STT contract) is implemented; irrelevant for chat.
+    voice_protocol: str = "http_json"
 
 
 class AgentKnowledge(BaseModel):
@@ -38,6 +41,7 @@ def _row_to_dict(row) -> dict:
     return {
         "id": r["id"], "name": r["name"], "kind": r["kind"],
         "modality": r.get("modality") or "chat",
+        "voice_protocol": r.get("voice_protocol") or "http_json",
         "endpoint_url": r["endpoint_url"], "response_path": r["response_path"],
         "description": r["description"], "created_at": r["created_at"],
         "knowledge_name": r.get("knowledge_name"),
@@ -80,6 +84,7 @@ def register(body: RegisterAgent) -> dict:
         auth_header=body.auth_header,
         description=body.description,
         modality=body.modality,
+        voice_protocol=body.voice_protocol,
     )
     return {"agent_id": agent_id}
 

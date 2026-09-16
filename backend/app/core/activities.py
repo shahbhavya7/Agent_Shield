@@ -149,8 +149,13 @@ async def replay_scenario(run_id: int, scenario: dict, agent: dict) -> int:
 
     Unkeyed on purpose: replay exists to produce a second, independent conversation for
     a scenario that already has one, so the caller can compare before and after a fix.
+
+    Modality-aware for the same reason play_voice_scenario is: a voice agent's replay
+    must go through the AI Caller (TTS/STT), or it would send raw text into a `message`
+    field that endpoint expects as base64 audio.
     """
-    return await run_scenario(run_id, scenario, agent, idem_key=None)
+    send_fn = call_voice_agent if agent.get("modality") == "voice" else None
+    return await run_scenario(run_id, scenario, agent, idem_key=None, send_fn=send_fn)
 
 
 @activity.defn

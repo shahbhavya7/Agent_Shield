@@ -141,6 +141,13 @@ def init_schema() -> None:
         -- The Temporal workflow reads this to pick play_scenario vs play_voice_scenario.
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS modality TEXT NOT NULL DEFAULT 'chat';
 
+        -- Which wire protocol a voice-modality agent speaks. Only 'http_json' (the
+        -- existing TTS -> adapter.send() -> STT contract) is implemented today;
+        -- 'websocket' and 'twilio' are recognized names app.core.voice_caller rejects
+        -- with a controlled error until a later phase implements them. Meaningless for
+        -- modality='chat'. Defaulted so every existing agent keeps working unchanged.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS voice_protocol TEXT NOT NULL DEFAULT 'http_json';
+
         -- Idempotency, so a re-executed unit of work converges on the same rows instead
         -- of appending new ones. This is the precondition for turning on retries.
         --
@@ -198,15 +205,16 @@ def insert_agent(
     auth_header: str | None = None,
     description: str | None = None,
     modality: str = "chat",
+    voice_protocol: str = "http_json",
 ) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO agents
            (name, kind, endpoint_url, auth_header, request_template,
-            response_path, description, created_at, modality)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            response_path, description, created_at, modality, voice_protocol)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (name, kind, endpoint_url, auth_header, request_template,
-         response_path, description, now_iso(), modality),
+         response_path, description, now_iso(), modality, voice_protocol),
     )
     agent_id = cur.fetchone()["id"]
     conn.commit()

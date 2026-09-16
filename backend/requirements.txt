@@ -7,3 +7,5 @@ python-dotenv
 psycopg[binary]
 pyyaml
 temporalio
+websockets
+twilio

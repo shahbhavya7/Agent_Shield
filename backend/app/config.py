@@ -70,6 +70,16 @@ VOICE_STT_MODEL: str = os.getenv("VOICE_STT_MODEL", "whisper-1")
 VOICE_TTS_MODEL: str = os.getenv("VOICE_TTS_MODEL", "tts-1")
 VOICE_TTS_VOICE: str = os.getenv("VOICE_TTS_VOICE", "alloy")
 
+# --- Voice (Phase 3A: Twilio, one call per turn) ------------------------------
+# Twilio account credentials + the number AgentShield places outbound test calls
+# from. PUBLIC_BASE_URL is AgentShield's OWN publicly reachable address (e.g. an
+# ngrok URL in dev) — Twilio calls back to it (webhook + Media Stream), the reverse
+# direction from every other transport, which always calls OUT to the agent.
+TWILIO_ACCOUNT_SID: str = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN: str = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER: str = os.getenv("TWILIO_FROM_NUMBER", "")
+PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
+
 # --- Agent name mapping (backend/mapping.yaml) -------------------------------
 # Maps the internal agent identifier used in the repo (Domain.key, or the module name
 # for the standalone sample_rag_bot) to the agent's actual / display name.

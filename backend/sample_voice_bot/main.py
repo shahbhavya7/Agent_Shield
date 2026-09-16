@@ -1,4 +1,4 @@
-"""AgentShield SAMPLE **voice** bot — Phase 2A standalone voice-contract target.
+"""AgentShield SAMPLE **voice** bot — standalone voice-contract target.
 
 A separate, tiny FastAPI service (port 8008) that does real audio in -> audio out:
 
@@ -7,20 +7,28 @@ A separate, tiny FastAPI service (port 8008) that does real audio in -> audio ou
 This is a DEVELOPMENT/DEMO target, not production telephony infrastructure. It is fully
 independent of AgentShield — it imports nothing from the `app` package, has its own env
 loading and its own OpenAI client — exactly the same isolation `sample_bot` and
-`sample_rag_bot` already use. AgentShield (once wired up in a later phase) would reach it
-ONLY over HTTP via /voice-chat, exactly like any third-party voice agent.
+`sample_rag_bot` already use. AgentShield reaches it ONLY over HTTP/WebSocket, exactly
+like any third-party voice agent.
 
-Wire contract (deliberately the SAME envelope as the existing /chat contract, so the
-existing black-box HTTP adapter needs no changes to reach it later):
+Two transports, same underlying turn logic (`_handle_turn`, below) — one agent "brain",
+reused rather than duplicated:
 
-    POST /voice-chat
-        { message: "<base64 WAV>", history: [{role, content}], faults: [] }
-        -> { reply: "<base64 WAV>", trace: { transcript_in, transcript_out,
-                                              latency_ms, tokens } }
+  POST /voice-chat        (Phase 2A/2B — the http_json voice_protocol contract)
+      { message: "<base64 WAV>", history: [{role, content}], faults: [] }
+      -> { reply: "<base64 WAV>", trace: { transcript_in, transcript_out,
+                                            latency_ms, tokens } }
+
+  WS   /voice-chat/ws      (Phase 2 — the websocket voice_protocol contract)
+      one connection PER TURN (opened, used once, closed — no persistent multi-turn
+      session yet, matching app.core.voice_caller's current scope):
+      client -> server: {"type": "audio", "audio": "<base64 WAV>",
+                          "history": [{role, content}], "faults": []}
+      server -> client: {"type": "audio", "audio": "<base64 WAV>", "trace": {...}}
+                     or: {"type": "error", "error": "..."}
 
 `history` stays TEXT (the transcript of prior turns), not audio — the same convention
-sample_rag_bot uses for conversational context. `faults` is accepted for shape-parity
-with the chat contract but is a no-op in Phase 2A; nothing reads it yet.
+sample_rag_bot uses for conversational context. `faults` is accepted on both transports
+for shape-parity with the chat contract but is a no-op; nothing reads it yet.
 
 Run standalone (from backend/, or anywhere with the deps + OPENAI_API_KEY set):
     uvicorn sample_voice_bot.main:app --port 8008 --reload
@@ -38,7 +46,7 @@ import os
 import time
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
@@ -100,14 +108,19 @@ async def _synthesize(text: str) -> bytes:
     return resp.content
 
 
-@app.post("/voice-chat")
-async def voice_chat(req: VoiceChatIn) -> dict:
+async def _handle_turn(message_b64: str, history: list[ChatTurn]) -> dict:
+    """Shared turn logic: base64 WAV in -> STT -> LLM reply -> TTS -> base64 WAV out.
+
+    Used by BOTH POST /voice-chat and WS /voice-chat/ws, so the two transports share
+    one identical agent "brain" — this is the only place that knows how this sample
+    agent thinks. Returns {"reply": "<base64 WAV or empty on failure>", "trace": {...}}.
+    """
     start = time.time()
     trace: dict = {"transcript_in": "", "transcript_out": "", "latency_ms": 0, "tokens": 0}
 
     # --- decode input audio ----------------------------------------------------
     try:
-        audio_in = base64.b64decode(req.message)
+        audio_in = base64.b64decode(message_b64)
     except Exception as e:
         trace["error"] = f"invalid base64 audio in 'message': {e}"
         trace["latency_ms"] = int((time.time() - start) * 1000)
@@ -127,7 +140,7 @@ async def voice_chat(req: VoiceChatIn) -> dict:
     tokens = 0
     if transcript_in:
         messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for turn in req.history:
+        for turn in history:
             role = "assistant" if turn.role in ("agent", "assistant") else "user"
             messages.append({"role": role, "content": turn.content})
         messages.append({"role": "user", "content": transcript_in})
@@ -160,3 +173,59 @@ async def voice_chat(req: VoiceChatIn) -> dict:
 
     trace["latency_ms"] = int((time.time() - start) * 1000)
     return {"reply": reply_b64, "trace": trace}
+
+
+@app.post("/voice-chat")
+async def voice_chat(req: VoiceChatIn) -> dict:
+    return await _handle_turn(req.message, req.history)
+
+
+@app.websocket("/voice-chat/ws")
+async def voice_chat_ws(websocket: WebSocket) -> None:
+    """WebSocket mirror of POST /voice-chat — one turn per connection (no persistent
+    multi-turn session yet, matching app.core.voice_caller's current scope).
+
+    Client -> Server: {"type": "audio", "audio": "<base64 WAV>",
+                        "history": [{"role","content"}], "faults": [...]}
+    Server -> Client: {"type": "audio", "audio": "<base64 WAV>", "trace": {...}}
+                   or: {"type": "error", "error": "..."}
+    """
+    await websocket.accept()
+    try:
+        raw = await websocket.receive_json()
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "error": f"invalid request: {e}"})
+        except Exception:
+            pass
+        await websocket.close()
+        return
+
+    if not isinstance(raw, dict) or raw.get("type") != "audio" or not raw.get("audio"):
+        await websocket.send_json({
+            "type": "error",
+            "error": "expected {'type': 'audio', 'audio': '<base64 wav>', ...}",
+        })
+        await websocket.close()
+        return
+
+    try:
+        history = [ChatTurn(**h) for h in (raw.get("history") or [])]
+    except Exception as e:
+        await websocket.send_json({"type": "error", "error": f"invalid 'history': {e}"})
+        await websocket.close()
+        return
+
+    result = await _handle_turn(raw["audio"], history)
+
+    if not result["reply"]:
+        await websocket.send_json({
+            "type": "error",
+            "error": result["trace"].get("error", "unknown error"),
+            "trace": result["trace"],
+        })
+    else:
+        await websocket.send_json({
+            "type": "audio", "audio": result["reply"], "trace": result["trace"],
+        })
+    await websocket.close()
