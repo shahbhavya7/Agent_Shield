@@ -148,6 +148,19 @@ def init_schema() -> None:
         -- modality='chat'. Defaulted so every existing agent keeps working unchanged.
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS voice_protocol TEXT NOT NULL DEFAULT 'http_json';
 
+        -- Which HTTP verb the adapter uses to call endpoint_url. 'POST' (default) sends
+        -- request_template as the JSON body, unchanged from before this column existed.
+        -- 'GET' sends message/history/faults as query parameters instead (see
+        -- query_param_map) for black-box agents whose API only accepts GET.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS http_method TEXT NOT NULL DEFAULT 'POST';
+
+        -- Only meaningful when http_method='GET'. JSON object mapping the semantic
+        -- fields the adapter knows about ("message", "history", "faults") to the actual
+        -- query parameter names the target agent expects, e.g. '{"message":"q"}'. A
+        -- field omitted from the map is simply not sent. NULL/empty falls back to
+        -- app.core.adapter.DEFAULT_QUERY_PARAM_MAP.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS query_param_map TEXT;
+
         -- Idempotency, so a re-executed unit of work converges on the same rows instead
         -- of appending new ones. This is the precondition for turning on retries.
         --
@@ -206,20 +219,55 @@ def insert_agent(
     description: str | None = None,
     modality: str = "chat",
     voice_protocol: str = "http_json",
+    http_method: str = "POST",
+    query_param_map: str | None = None,
 ) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO agents
            (name, kind, endpoint_url, auth_header, request_template,
-            response_path, description, created_at, modality, voice_protocol)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            response_path, description, created_at, modality, voice_protocol,
+            http_method, query_param_map)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (name, kind, endpoint_url, auth_header, request_template,
-         response_path, description, now_iso(), modality, voice_protocol),
+         response_path, description, now_iso(), modality, voice_protocol,
+         http_method, query_param_map),
     )
     agent_id = cur.fetchone()["id"]
     conn.commit()
     conn.close()
     return agent_id
+
+
+def update_agent_connection(
+    agent_id: int,
+    auth_header: str | None,
+    request_template: str,
+    response_path: str,
+    modality: str,
+    voice_protocol: str,
+    http_method: str,
+    query_param_map: str | None,
+) -> None:
+    """Refresh a re-registered agent's connection details in place.
+
+    Re-registering the same name+endpoint (POST /agents) reuses the existing row so
+    its customer context and stored test cases stay attached — but that means a
+    corrected auth_header/protocol/create-call body typed on a SECOND attempt was
+    previously discarded silently (only description ever got updated), so a wrong
+    API key or protocol typed on attempt 1 stuck around forever no matter how many
+    times the form was resubmitted. This makes every reconnect attempt authoritative.
+    """
+    conn = get_conn()
+    conn.execute(
+        """UPDATE agents SET auth_header = %s, request_template = %s, response_path = %s,
+           modality = %s, voice_protocol = %s, http_method = %s, query_param_map = %s
+           WHERE id = %s""",
+        (auth_header, request_template, response_path, modality, voice_protocol,
+         http_method, query_param_map, agent_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def update_agent_description(agent_id: int, description: str) -> None:

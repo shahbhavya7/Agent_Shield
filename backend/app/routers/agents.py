@@ -9,6 +9,7 @@ from app.db import (
     insert_agent,
     list_agents,
     set_agent_knowledge,
+    update_agent_connection,
     update_agent_description,
 )
 
@@ -28,6 +29,12 @@ class RegisterAgent(BaseModel):
     # Which wire protocol a voice-modality agent speaks. Only "http_json" (the
     # existing TTS -> HTTP -> STT contract) is implemented; irrelevant for chat.
     voice_protocol: str = "http_json"
+    # "POST" (default, unchanged behavior) or "GET" for black-box agents whose API only
+    # accepts GET. GET agents ignore request_template and use query_param_map instead.
+    http_method: str = "POST"
+    # Only used when http_method="GET". JSON string mapping "message"/"history"/"faults"
+    # to the query parameter names the target agent expects, e.g. '{"message":"q"}'.
+    query_param_map: str | None = None
 
 
 class AgentKnowledge(BaseModel):
@@ -43,6 +50,8 @@ def _row_to_dict(row) -> dict:
         "modality": r.get("modality") or "chat",
         "voice_protocol": r.get("voice_protocol") or "http_json",
         "endpoint_url": r["endpoint_url"], "response_path": r["response_path"],
+        "http_method": r.get("http_method") or "POST",
+        "query_param_map": r.get("query_param_map"),
         "description": r["description"], "created_at": r["created_at"],
         "knowledge_name": r.get("knowledge_name"),
         "knowledge_chars": len(r.get("knowledge") or ""),
@@ -67,10 +76,23 @@ def register(body: RegisterAgent) -> dict:
     """Register a custom (black-box) agent. Faults won't be injected; trace = whatever it returns.
 
     Re-registering the same name+endpoint returns the existing agent instead of inserting a
-    duplicate, so reconnecting keeps the agent's customer context and saved test cases.
+    duplicate, so reconnecting keeps the agent's customer context and saved test cases — but
+    every OTHER connection detail (auth header, protocol, request template/create-call body,
+    http method) is refreshed from this submission too, so correcting a wrong API key or
+    protocol on a second attempt actually takes effect instead of being silently discarded.
     """
     existing = get_agent_by_name_and_endpoint(body.name, body.endpoint_url)
     if existing:
+        update_agent_connection(
+            existing["id"],
+            auth_header=body.auth_header,
+            request_template=body.request_template,
+            response_path=body.response_path,
+            modality=body.modality,
+            voice_protocol=body.voice_protocol,
+            http_method=body.http_method,
+            query_param_map=body.query_param_map,
+        )
         if body.description:
             update_agent_description(existing["id"], body.description)
         return {"agent_id": existing["id"]}
@@ -85,22 +107,48 @@ def register(body: RegisterAgent) -> dict:
         description=body.description,
         modality=body.modality,
         voice_protocol=body.voice_protocol,
+        http_method=body.http_method,
+        query_param_map=body.query_param_map,
     )
     return {"agent_id": agent_id}
 
 
 @router.post("/{agent_id}/probe")
 async def probe(agent_id: int) -> dict:
-    """Real connectivity check: send one trivial message through the adapter and report back.
+    """Real connectivity check: send one trivial message through the agent's actual
+    transport and report back.
 
     Powers the UI's 'Verify Connection' step — it genuinely reaches the endpoint.
+    Chat agents go through app.core.adapter.send() directly, unchanged. Voice agents
+    go through app.core.voice_caller.call_voice_agent() instead — the SAME dispatcher
+    a real run uses — so this probes whatever voice_protocol the agent is actually
+    configured with (http_json's TTS/STT round-trip, a one-shot websocket turn, or a
+    real native_ws call-session), rather than a raw HTTP POST no voice contract
+    actually accepts. A one-off session_key is used and always closed, so a
+    persistent-session protocol (native_ws) never leaks a live call past this probe.
     """
-    from app.core.adapter import send
-
     a = get_agent(agent_id)
     if a is None:
         raise HTTPException(status_code=404, detail=f"agent {agent_id} not found")
-    result = await send(a, "Connectivity test from AgentShield. Please reply 'ok'.", [], [])
+
+    message = "Connectivity test from AgentShield. Please reply 'ok'."
+    if (a.get("modality") or "chat") == "voice":
+        import uuid
+
+        from app.core.voice_caller import call_voice_agent, close_voice_session
+
+        session_key = f"probe:{agent_id}:{uuid.uuid4().hex}"
+        try:
+            result = await call_voice_agent(
+                a, message, [], [], session_key=session_key, is_last_turn=True,
+            )
+        finally:
+            await close_voice_session(a, session_key)
+    else:
+        from app.core.adapter import send
+
+        result = await send(a, message, [], [])
+
     reply = result.get("reply", "")
     trace = result.get("trace", {}) or {}
     ok = reply != "<error>" and not trace.get("error")

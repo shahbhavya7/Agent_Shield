@@ -287,6 +287,13 @@ export default function DashboardPage() {
   const [endpointUrl, setEndpointUrl] = useState("http://localhost:8002/chat");
   const [apiKey, setApiKey] = useState("");
   const [provider, setProvider] = useState("openai");
+  // Voice-modality only: which wire protocol the agent speaks. "http_json" (default)
+  // TTS/STTs through the same black-box HTTP adapter chat agents use. "native_ws"
+  // holds one WebSocket open for the whole scenario against a target that speaks its
+  // own call-session protocol directly — createCallBody is the JSON POSTed to create
+  // that call (e.g. {"client": "acme"}), reusing endpoint_url as the HTTP base.
+  const [voiceProtocol, setVoiceProtocol] = useState<"http_json" | "native_ws">("http_json");
+  const [createCallBody, setCreateCallBody] = useState("");
   // Knowledge source (priority): uploaded docs > free-text about > auto-discovery.
   const [knowledgeText, setKnowledgeText] = useState("");
   const [knowledgeFile, setKnowledgeFile] = useState("");
@@ -397,7 +404,8 @@ export default function DashboardPage() {
   const canVerify =
     agentName.trim().length > 0 &&
     endpointUrl.trim().length > 0 &&
-    (knowledgeText.trim().length > 0 || aboutText.trim().length > 0);
+    (knowledgeText.trim().length > 0 || aboutText.trim().length > 0) &&
+    (modality !== "voice" || voiceProtocol !== "native_ws" || createCallBody.trim().length > 0);
   const canGenerate = selectedTests.length > 0 && !generating;
   const canRunTest = plannedScenarios > 0 && !starting && !generating;
   const aiCount = testCases.filter((c) => c.source === "ai").length;
@@ -413,6 +421,8 @@ export default function DashboardPage() {
     setActiveIdx(0);
     setStep("connect");
     setApiKey("");
+    setVoiceProtocol("http_json");
+    setCreateCallBody("");
     setKnowledgeText("");
     setKnowledgeFile("");
     setAboutText("");
@@ -542,6 +552,11 @@ export default function DashboardPage() {
         auth_header: auth,
         description: aboutText.trim() || undefined,
         modality,
+        voice_protocol: modality === "voice" ? voiceProtocol : undefined,
+        request_template:
+          modality === "voice" && voiceProtocol === "native_ws"
+            ? createCallBody.trim()
+            : undefined,
       });
       setAgentId(agent_id);
       // Store the uploaded docs on the agent so every later run stays grounded on them.
@@ -983,6 +998,56 @@ export default function DashboardPage() {
                       />
                     </div>
                   </div>
+
+                  {modality === "voice" && (
+                    <div>
+                      <label className="text-xs font-medium text-[#9CA3AF]">Voice Protocol</label>
+                      <div className="mt-2 grid grid-cols-2 gap-3">
+                        {(
+                          [
+                            { id: "http_json" as const, label: "HTTP (TTS / STT)" },
+                            { id: "native_ws" as const, label: "Native WebSocket" },
+                          ]
+                        ).map((p) => {
+                          const active = voiceProtocol === p.id;
+                          return (
+                            <button
+                              key={p.id}
+                              onClick={() => setVoiceProtocol(p.id)}
+                              className={`rounded-lg border px-3 py-3 text-xs font-medium transition-all duration-300 ${
+                                active ? "border-white/50 bg-white/10 text-[#F8FAFC] shadow-[0_0_20px_rgba(255,255,255,0.15)]" : "border-white/10 bg-white/2 text-slate-400 hover:border-white/20 hover:text-[#F8FAFC]"
+                              }`}
+                            >
+                              {p.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p className="mt-2 text-xs text-slate-500">
+                        {voiceProtocol === "http_json"
+                          ? "One HTTP call per turn — AgentShield speaks the audio (TTS in, STT out)."
+                          : "One persistent WebSocket for the whole scenario, against an agent that speaks its own call-session protocol (e.g. create-a-call + simulated_utterance)."}
+                      </p>
+
+                      {voiceProtocol === "native_ws" && (
+                        <div className="mt-3">
+                          <label className="text-xs font-medium text-[#9CA3AF]">Create-call request body (JSON)</label>
+                          <div className="mt-2 flex items-center gap-3 rounded-lg border border-white/12 bg-white/2 px-4 py-3 transition-colors duration-300 focus-within:border-white/30">
+                            <Link2 className="h-4 w-4 shrink-0 text-slate-400" strokeWidth={1.5} />
+                            <input
+                              value={createCallBody}
+                              onChange={(e) => setCreateCallBody(e.target.value)}
+                              placeholder='{"client": "your_client_slug"}'
+                              className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600"
+                            />
+                          </div>
+                          <p className="mt-1 text-xs text-slate-500">
+                            POSTed to {"{"}Endpoint URL{"}"}/api/calls to create the call; the returned call_id opens the WebSocket at {"{"}Endpoint URL, ws(s)://{"}"}/api/ws/{"{"}call_id{"}"}.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">API Key <span className="text-slate-600">(optional)</span></label>

@@ -26,6 +26,12 @@ from app.db import (
 #   {faults}  -> JSON array          (no quotes)
 DEFAULT_REQUEST_TEMPLATE = '{"message":"{message}","history":{history},"faults":{faults}}'
 
+# For http_method="GET" agents: maps the semantic fields the adapter knows about to the
+# query parameter names the target agent actually expects. A field left out of an agent's
+# own query_param_map is simply not sent (e.g. a GET agent that only accepts ?message=...
+# and has no concept of history/faults).
+DEFAULT_QUERY_PARAM_MAP = {"message": "message", "history": "history", "faults": "faults"}
+
 # Domain descriptions for the agents in inventory.yaml. This is the ONLY thing the scenario
 # generator knows about an agent when no docs are uploaded, so a placeholder here means test
 # cases get invented from general knowledge instead of the agent's actual domain.
@@ -97,6 +103,20 @@ def _render_body(template: str, message: str, history: list, faults: list) -> di
         return {"message": message, "history": history, "faults": faults}
 
 
+def _render_query_params(param_map: dict, message: str, history: list, faults: list) -> dict:
+    """Build query params for a GET agent from its query_param_map.
+
+    history/faults are JSON-encoded since query strings only carry text; message is sent
+    as-is. Semantic fields the map doesn't mention are left out entirely.
+    """
+    values = {"message": message, "history": json.dumps(history), "faults": json.dumps(faults)}
+    return {
+        param_name: values[field]
+        for field, param_name in param_map.items()
+        if field in values and param_name
+    }
+
+
 def _extract_by_path(data: Any, dot_path: str) -> Any:
     """Walk a dot-path like 'reply' or 'data.choices.0.text' through dicts/lists."""
     cur = data
@@ -140,9 +160,9 @@ async def send(
     # Only agent-cooperative faults are forwarded to the agent's own API.
     faults = [f for f in faults if f in AGENT_FAULTS]
 
-    template = agent.get("request_template") or DEFAULT_REQUEST_TEMPLATE
     response_path = agent.get("response_path") or "reply"
     url = agent.get("endpoint_url")
+    http_method = (agent.get("http_method") or "POST").upper()
     headers = {"content-type": "application/json"}
     if agent.get("auth_header"):
         # Stored as a single "Header: value" string.
@@ -150,11 +170,20 @@ async def send(
         if name and value:
             headers[name.strip()] = value.strip()
 
-    body = _render_body(template, message, history, faults)
-
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
-            resp = await client.post(url, json=body, headers=headers)
+            if http_method == "GET":
+                raw_map = agent.get("query_param_map")
+                try:
+                    param_map = json.loads(raw_map) if raw_map else DEFAULT_QUERY_PARAM_MAP
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    param_map = DEFAULT_QUERY_PARAM_MAP
+                params = _render_query_params(param_map, message, history, faults)
+                resp = await client.get(url, params=params, headers=headers)
+            else:
+                template = agent.get("request_template") or DEFAULT_REQUEST_TEMPLATE
+                body = _render_body(template, message, history, faults)
+                resp = await client.post(url, json=body, headers=headers)
             resp.raise_for_status()
             data = resp.json()
     except httpx.TimeoutException:

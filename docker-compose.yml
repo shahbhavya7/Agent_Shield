@@ -49,7 +49,7 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "8100:8000"
     networks:
       - agentshield-net
 

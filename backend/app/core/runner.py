@@ -69,6 +69,7 @@ async def run_scenario(
     agent: Any,
     idem_key: str | None = None,
     send_fn: Optional[Callable[..., Awaitable[dict]]] = None,
+    close_fn: Optional[Callable[[Any, int], Awaitable[None]]] = None,
 ) -> int:
     """Play a scenario end-to-end. Returns the (unjudged) conversation id.
 
@@ -84,7 +85,22 @@ async def run_scenario(
     app.core.voice_caller.call_voice_agent here instead — everything else in this
     function (seed turns, adaptive follow-up, persistence, idempotency) is identical
     for both modalities; only how one turn reaches the agent differs.
+
+    When `send_fn` is explicitly supplied (never true for chat, which always omits
+    it), each call additionally receives `session_key=conv_id` and `is_last_turn`
+    keyword arguments — the stable per-conversation identifier every transport can use
+    to correlate its own state across turns (Twilio's persistent call/session is the
+    one that actually needs this; http_json/websocket simply ignore it). `conv_id` is
+    already computed once, above the turn loop, for persistence — this reuses that
+    same value rather than inventing a second identifier.
+
+    `close_fn(agent, conv_id)`, if given, is awaited exactly once after the turn loop
+    finishes — however it finishes, success or exception — so a transport holding
+    cross-turn state (again, only Twilio does) has a GUARANTEED place to tear it down,
+    even if `is_last_turn` was never true (e.g. a scenario whose adaptive follow-up
+    never actually appended a turn). Defaults to a no-op; chat never supplies one.
     """
+    custom_send_fn = send_fn is not None
     send_fn = send_fn or send
     scenario_id = scenario["_id"]
     conv_id = get_or_create_conversation(run_id, scenario_id, idem_key)
@@ -102,41 +118,60 @@ async def run_scenario(
     tester_turns_played = 0
     did_followup = False
 
-    i = 0
-    while i < len(seed_turns) and tester_turns_played < MAX_TESTER_TURNS:
-        tester_msg = seed_turns[i]
+    try:
+        i = 0
+        while i < len(seed_turns) and tester_turns_played < MAX_TESTER_TURNS:
+            tester_msg = seed_turns[i]
 
-        # --- tester turn ---
-        insert_message(conv_id, turn_index, "tester", tester_msg, None)
-        transcript.append({"role": "tester", "content": tester_msg})
-        turn_index += 1
-        tester_turns_played += 1
+            # --- tester turn ---
+            insert_message(conv_id, turn_index, "tester", tester_msg, None)
+            transcript.append({"role": "tester", "content": tester_msg})
+            turn_index += 1
+            tester_turns_played += 1
 
-        # --- agent turn (fault injected here) ---
-        result = await send_fn(agent, tester_msg, history_for_agent, faults)
-        reply, trace = result["reply"], result.get("trace", {})
-        insert_message(conv_id, turn_index, "agent", reply, trace)
-        transcript.append({"role": "agent", "content": reply})
-        turn_index += 1
+            # Whether the loop is CERTAIN to stop after this turn — i.e. this is the
+            # last seed turn AND no adaptive follow-up could still extend it. Computed
+            # here (same expression the follow-up check below already used, just
+            # hoisted earlier) so a transport can be told up front; conservatively
+            # False whenever a follow-up might still get appended, since that decision
+            # itself isn't made until after this turn's reply comes back.
+            is_last_seed = i == len(seed_turns) - 1
+            could_extend = (
+                scenario["test_type"] in ADAPTIVE_TYPES
+                and len(seed_turns) < MIN_ADAPTIVE_SEED_TURNS
+                and is_last_seed
+                and not did_followup
+                and tester_turns_played < MAX_TESTER_TURNS
+            )
+            is_last_turn = is_last_seed and not could_extend
 
-        # update rolling history for the next agent call
-        history_for_agent.append({"role": "user", "content": tester_msg})
-        history_for_agent.append({"role": "assistant", "content": reply})
+            # --- agent turn (fault injected here) ---
+            if custom_send_fn:
+                result = await send_fn(
+                    agent, tester_msg, history_for_agent, faults,
+                    session_key=conv_id, is_last_turn=is_last_turn,
+                )
+            else:
+                result = await send_fn(agent, tester_msg, history_for_agent, faults)
+            reply, trace = result["reply"], result.get("trace", {})
+            insert_message(conv_id, turn_index, "agent", reply, trace)
+            transcript.append({"role": "agent", "content": reply})
+            turn_index += 1
 
-        # --- semi-adaptive follow-up: FALLBACK ONLY, for suites with no pressing turn ---
-        is_last_seed = i == len(seed_turns) - 1
-        if (
-            scenario["test_type"] in ADAPTIVE_TYPES
-            and len(seed_turns) < MIN_ADAPTIVE_SEED_TURNS
-            and is_last_seed
-            and not did_followup
-            and tester_turns_played < MAX_TESTER_TURNS
-        ):
-            followup = await _adaptive_followup(scenario, transcript)
-            if followup:
-                seed_turns.append(followup)  # loop will play it next
-                did_followup = True
+            # update rolling history for the next agent call
+            history_for_agent.append({"role": "user", "content": tester_msg})
+            history_for_agent.append({"role": "assistant", "content": reply})
 
-        i += 1
+            # --- semi-adaptive follow-up: FALLBACK ONLY, for suites with no pressing turn ---
+            if could_extend:
+                followup = await _adaptive_followup(scenario, transcript)
+                if followup:
+                    seed_turns.append(followup)  # loop will play it next
+                    did_followup = True
+
+            i += 1
+    finally:
+        if close_fn is not None:
+            await close_fn(agent, conv_id)
 
     return conv_id

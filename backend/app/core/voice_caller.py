@@ -16,10 +16,18 @@ Currently implemented:
       -> base64 WAV reply -> STT -> text (agent turn)
   "websocket"  -> _call_via_websocket(): same TTS/STT, one ws:// or wss:// connection
       PER TURN (opened, used once, closed — no persistent multi-turn session yet).
-  "twilio"     -> app.core.twilio_bridge._call_via_twilio(): same TTS/STT, ONE PHONE
-      CALL PER TURN (Phase 3A — no persistent multi-turn call yet either). See that
-      module's docstring; it is a much larger subsystem than the other two, since
-      Twilio's Media Streams protocol has no notion of "one turn" at all.
+  "twilio"     -> app.core.twilio_bridge._call_via_twilio(): same TTS/STT, but ONE
+      PHONE CALL for the WHOLE scenario (Phase 3B) — every turn reuses the same Call
+      SID and Media Stream, via `session_key`/`is_last_turn` (see close_voice_session
+      below). See that module's docstring; it is a much larger subsystem than the
+      other two, since Twilio's Media Streams protocol has no notion of "one turn" at
+      all — segmenting the continuous stream into turns is that module's real job.
+  "native_ws"  -> app.core.voice_native_ws._call_via_native_ws(): text only, NO
+      TTS/STT — a target that speaks its own call-session WebSocket protocol
+      directly (create a call over HTTP, then one PERSISTENT WebSocket for the
+      WHOLE scenario, driven with a `simulated_utterance` message per turn). Same
+      persistent-session shape as twilio, via the same `session_key`/`is_last_turn`
+      convention, but far simpler — no audio, no inbound webhook/router half.
 
 Failure handling deliberately mirrors app.core.adapter.send(): any failure (TTS, the
 transport call itself, STT, or an unsupported/unknown protocol) resolves to the SAME
@@ -53,11 +61,20 @@ async def call_voice_agent(
     message: str,
     history: Optional[list] = None,
     faults: Optional[list] = None,
+    session_key: Optional[Any] = None,
+    is_last_turn: bool = False,
 ) -> dict:
     """One voice turn — dispatches on agent["voice_protocol"] (default "http_json").
 
     Drop-in replacement for app.core.adapter.send() when passed as run_scenario's
-    send_fn — same signature, same return shape, for every protocol.
+    send_fn — same signature (plus the two trailing keyword-only additions below),
+    same return shape, for every protocol.
+
+    `session_key`/`is_last_turn` are run_scenario()'s stable per-conversation id and
+    its best-effort "no more turns are coming" signal (see runner.py's docstring for
+    exactly what "best-effort" means). http_json and websocket both ignore them —
+    neither holds any state across turns. Only twilio's persistent call/session
+    (Phase 3B) actually uses them.
     """
     protocol = agent.get("voice_protocol") or "http_json"
 
@@ -73,7 +90,21 @@ async def call_voice_agent(
         # http_json, or websocket voice testing — only this one branch.
         from app.core.twilio_bridge import _call_via_twilio
 
-        return await _call_via_twilio(agent, message, history, faults)
+        return await _call_via_twilio(
+            agent, message, history, faults,
+            session_key=session_key, is_last_turn=is_last_turn,
+        )
+
+    if protocol == "native_ws":
+        # Imported lazily for the same reason the twilio branch is: an environment
+        # with no `websockets`/`httpx` hiccup, or simply no native_ws agent ever
+        # configured, never affects chat, http_json, websocket, or twilio testing.
+        from app.core.voice_native_ws import _call_via_native_ws
+
+        return await _call_via_native_ws(
+            agent, message, history, faults,
+            session_key=session_key, is_last_turn=is_last_turn,
+        )
 
     if protocol in _KNOWN_UNIMPLEMENTED_PROTOCOLS:
         return {
@@ -85,6 +116,27 @@ async def call_voice_agent(
         "reply": AGENT_ERROR_SENTINEL,
         "trace": {"error": f"unknown voice_protocol '{protocol}'"},
     }
+
+
+async def close_voice_session(agent: Any, session_key: Any) -> None:
+    """Called exactly once from run_scenario()'s finally, for every voice-modality
+    scenario regardless of how it ended — see run_scenario()'s `close_fn` parameter.
+
+    A no-op for http_json/websocket: neither holds any state across turns, so there
+    is nothing to close. twilio's persistent call/session (Phase 3B) and native_ws's
+    persistent call/socket both need this; it is the GUARANTEED cleanup path (a
+    safety net for the case where no turn's `is_last_turn=True` ever actually fired
+    — see runner.py's docstring).
+    """
+    protocol = agent.get("voice_protocol") or "http_json"
+    if protocol == "twilio":
+        from app.core.twilio_bridge import close_twilio_session
+
+        await close_twilio_session(session_key)
+    elif protocol == "native_ws":
+        from app.core.voice_native_ws import close_native_ws_session
+
+        await close_native_ws_session(session_key)
 
 
 async def _call_via_http_json(

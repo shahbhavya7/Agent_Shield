@@ -50,7 +50,7 @@ on localhost with defaults.
 ```bash
 ./run_all.sh
 ```
-One command starts everything: the AgentShield backend (`:8000`), all 6 sample agents
+One command starts everything: the AgentShield backend (`:8100`), all 6 sample agents
 (`:8002`–`:8007`), the Temporal dev server + worker (if the `temporal` CLI is installed), and
 the frontend (`:3000`). Ctrl-C stops all of it.
 
@@ -69,7 +69,7 @@ temporal server start-dev      # UI at http://localhost:8233
 To run pieces by hand instead of `run_all.sh`:
 ```bash
 cd backend
-.venv/bin/uvicorn app.main:app --port 8000              # backend
+.venv/bin/uvicorn app.main:app --port 8100              # backend
 .venv/bin/python -m app.temporal.worker                 # worker (needs the Temporal server up)
 .venv/bin/uvicorn sample_rag_bot.main:app --port 8002    # + any sample agent you want, see below
 

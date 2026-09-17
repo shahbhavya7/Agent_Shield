@@ -1,6 +1,6 @@
 // AgentShield API client — talks to the FastAPI backend.
 export const API_BASE =
-  (process.env.NEXT_PUBLIC_API_URL as string | undefined) || "http://localhost:8000";
+  (process.env.NEXT_PUBLIC_API_URL as string | undefined) || "http://localhost:8100";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -184,6 +184,9 @@ export function registerAgent(body: {
   description?: string | null;
   // "chat" (default) or "voice" — which execution path the Temporal workflow uses.
   modality?: "chat" | "voice";
+  // Which wire protocol a voice-modality agent speaks. Ignored for chat. Defaults
+  // server-side to "http_json" when omitted.
+  voice_protocol?: "http_json" | "native_ws";
 }): Promise<{ agent_id: number }> {
   return req("/agents", { method: "POST", body: JSON.stringify(body) });
 }

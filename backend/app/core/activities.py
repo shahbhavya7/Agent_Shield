@@ -38,7 +38,7 @@ from app.core.judge import _endpoint_never_responded, judge_conversation
 from app.core.runner import run_scenario
 from app.core.scenarios import generate_scenarios
 from app.core.scoring import compute
-from app.core.voice_caller import call_voice_agent
+from app.core.voice_caller import call_voice_agent, close_voice_session
 from app.db import (
     get_agent,
     get_conversation,
@@ -135,11 +135,17 @@ async def play_voice_scenario(run_id: int, scenario: dict, agent: dict) -> int:
     so persistence, idempotency, and the adaptive follow-up all behave identically to
     the chat path. The Judge, Scoring, and Fixer only ever see the resulting text —
     they remain completely unaware anything was ever audio.
+
+    Phase 3B: `close_fn=close_voice_session` is the GUARANTEED cleanup hook a
+    persistent Twilio call/session needs (http_json/websocket ignore it — see that
+    function's docstring). Passed unconditionally, for every voice run, because it is
+    a no-op for every protocol except twilio.
     """
     return await run_scenario(
         run_id, scenario, agent,
         idem_key=f"run:{run_id}:scenario:{scenario['_id']}:voice",
         send_fn=call_voice_agent,
+        close_fn=close_voice_session,
     )
 
 
@@ -152,10 +158,15 @@ async def replay_scenario(run_id: int, scenario: dict, agent: dict) -> int:
 
     Modality-aware for the same reason play_voice_scenario is: a voice agent's replay
     must go through the AI Caller (TTS/STT), or it would send raw text into a `message`
-    field that endpoint expects as base64 audio.
+    field that endpoint expects as base64 audio. `close_fn` follows the same
+    modality-aware pattern as `send_fn` — None for chat, so it's skipped entirely.
     """
-    send_fn = call_voice_agent if agent.get("modality") == "voice" else None
-    return await run_scenario(run_id, scenario, agent, idem_key=None, send_fn=send_fn)
+    is_voice = agent.get("modality") == "voice"
+    send_fn = call_voice_agent if is_voice else None
+    close_fn = close_voice_session if is_voice else None
+    return await run_scenario(
+        run_id, scenario, agent, idem_key=None, send_fn=send_fn, close_fn=close_fn,
+    )
 
 
 @activity.defn
