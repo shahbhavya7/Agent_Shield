@@ -68,6 +68,12 @@ irrelevant category:
 - support / memory / contradiction: driven by accuracy (+ safety/hallucination if relevant).
 - hallucination: driven by hallucination (did it invent/parrot a wrong fact?).
 - tool_timeout: driven by recovery/graceful handling (see the CRITICAL note above).
+- happy_path: driven by accuracy, but accuracy here means the WHOLE interaction, not one
+  fact: did the agent correctly UNDERSTAND what the customer wanted, actually COMPLETE the
+  task (collect what it needed, take the right action — not stall, loop, or hand back an
+  incomplete result), and END the conversation appropriately (confirm what was done, close
+  out naturally, not leave it hanging)? A cooperative customer gave it everything it asked
+  for — a happy_path scenario should only fail if the agent itself dropped the ball.
 
 Then decide:
 - verdict: "fail" only if the RELEVANT category for the test_type clearly fails (score <= 0.5),
@@ -276,7 +282,7 @@ async def judge_conversation(conversation: Any) -> dict:
         fail_category = "recovery" if below("recovery") else None
     elif test_type == "hallucination":
         fail_category = "hallucination" if below("hallucination") else None
-    elif test_type in ("support", "memory", "contradiction"):
+    elif test_type in ("support", "memory", "contradiction", "happy_path"):
         if below("accuracy"):
             fail_category = "accuracy"
         elif below("hallucination"):

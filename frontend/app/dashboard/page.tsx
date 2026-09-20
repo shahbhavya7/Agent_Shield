@@ -44,6 +44,7 @@ import {
   Mic,
 } from "lucide-react";
 import {
+  API_BASE,
   createRunGroup,
   discoverAgent,
   generateScenarios,
@@ -75,6 +76,7 @@ const PROVIDERS = [
 
 // Each UI category maps to one of the backend test_type keys.
 const TEST_CATEGORIES = [
+  { label: "Happy Path", icon: CheckCircle2, type: "happy_path" },
   { label: "Prompt Injection", icon: ShieldAlert, type: "injection" },
   { label: "Hallucination", icon: AlertTriangle, type: "hallucination" },
   { label: "Tool Failure", icon: Wrench, type: "support" },
@@ -178,6 +180,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function prettify(type?: string): string {
   const map: Record<string, string> = {
+    happy_path: "Happy Path",
     support: "Tool / Support",
     injection: "Prompt Injection",
     hallucination: "Hallucination",
@@ -239,15 +242,61 @@ function Transcript({ messages }: { messages: Message[] }) {
   );
 }
 
-function TranscriptDetails({ messages, label }: { messages: Message[]; label: string }) {
+// Reuses the SAME `messages`/verdict data the transcript already renders from —
+// recording_url is just one more field on that same conversation payload
+// (backend/app/db.py's build_conversation_payload), nothing new fetched here.
+function RecordingPlayer({
+  url,
+  agentOnly,
+}: {
+  url: string | null | undefined;
+  agentOnly?: boolean;
+}) {
+  if (!url) {
+    return (
+      <p className="mt-3 flex items-center gap-1.5 text-xs text-slate-500">
+        <Mic className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+        No recording available
+      </p>
+    );
+  }
   return (
-    <details className="group mt-4">
-      <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-slate-400 transition-colors hover:text-slate-200">
-        <ArrowRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
-        {label}
-      </summary>
-      <Transcript messages={messages} />
-    </details>
+    <div className="mt-3">
+      <div className="flex items-center gap-2">
+        <Mic className="h-3.5 w-3.5 shrink-0 text-slate-400" strokeWidth={1.5} />
+        <audio controls preload="none" src={`${API_BASE}${url}`} className="h-8 w-full max-w-sm" />
+      </div>
+      {agentOnly && (
+        <p className="mt-1.5 pl-5 text-[11px] text-slate-500">
+          Agent audio only — this protocol drives the caller via text, so no caller audio exists.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function TranscriptDetails({
+  messages,
+  label,
+  recordingUrl,
+  recordingAgentOnly,
+}: {
+  messages: Message[];
+  label: string;
+  recordingUrl?: string | null;
+  recordingAgentOnly?: boolean;
+}) {
+  return (
+    <>
+      <RecordingPlayer url={recordingUrl} agentOnly={recordingAgentOnly} />
+      <details className="group mt-2">
+        <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-slate-400 transition-colors hover:text-slate-200">
+          <ArrowRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+          {label}
+        </summary>
+        <Transcript messages={messages} />
+      </details>
+    </>
   );
 }
 
@@ -856,6 +905,8 @@ export default function DashboardPage() {
         fix: c.suggested_fix || "",
         evidence: c.evidence || "",
         messages: c.messages || [],
+        recordingUrl: c.recording_url || null,
+        recordingAgentOnly: !!c.recording_agent_only,
       }));
   }, [report]);
 
@@ -866,6 +917,8 @@ export default function DashboardPage() {
         scenario: c.scenario_title || "Untitled scenario",
         category: prettify(c.test_type),
         messages: c.messages || [],
+        recordingUrl: c.recording_url || null,
+        recordingAgentOnly: !!c.recording_agent_only,
       }));
   }, [report]);
 
@@ -1684,6 +1737,8 @@ export default function DashboardPage() {
                         <TranscriptDetails
                           messages={row.messages}
                           label={`View what AgentShield asked & how it broke (${row.messages.length} turns)`}
+                          recordingUrl={row.recordingUrl}
+                          recordingAgentOnly={row.recordingAgentOnly}
                         />
                       </div>
                     ))}
@@ -1739,7 +1794,12 @@ export default function DashboardPage() {
                             {row.category}
                           </span>
                         </div>
-                        <TranscriptDetails messages={row.messages} label={`View transcript & trace (${row.messages.length} turns)`} />
+                        <TranscriptDetails
+                          messages={row.messages}
+                          label={`View transcript & trace (${row.messages.length} turns)`}
+                          recordingUrl={row.recordingUrl}
+                          recordingAgentOnly={row.recordingAgentOnly}
+                        />
                       </div>
                     ))}
                   </div>

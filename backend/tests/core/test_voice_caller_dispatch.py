@@ -10,7 +10,7 @@ from app.core import voice_caller
 async def test_http_json_dispatch_unchanged(monkeypatch):
     called = {}
 
-    async def fake_http_json(agent, message, history, faults):
+    async def fake_http_json(agent, message, history, faults, session_key=None):
         called["args"] = (agent, message, history, faults)
         return {"reply": "ok", "trace": {}}
 
@@ -22,7 +22,7 @@ async def test_http_json_dispatch_unchanged(monkeypatch):
 
 
 async def test_default_protocol_is_still_http_json(monkeypatch):
-    async def fake_http_json(agent, message, history, faults):
+    async def fake_http_json(agent, message, history, faults, session_key=None):
         return {"reply": "default-path", "trace": {}}
 
     monkeypatch.setattr(voice_caller, "_call_via_http_json", fake_http_json)
@@ -32,7 +32,7 @@ async def test_default_protocol_is_still_http_json(monkeypatch):
 
 
 async def test_websocket_dispatch_unchanged(monkeypatch):
-    async def fake_ws(agent, message, history, faults):
+    async def fake_ws(agent, message, history, faults, session_key=None):
         return {"reply": "ws-ok", "trace": {}}
 
     monkeypatch.setattr(voice_caller, "_call_via_websocket", fake_ws)
@@ -109,3 +109,22 @@ async def test_close_voice_session_http_json_and_websocket_are_noops():
     # Must not raise, and must not attempt to import twilio/native_ws machinery at all.
     await voice_caller.close_voice_session({"voice_protocol": "http_json"}, "conv-1")
     await voice_caller.close_voice_session({"voice_protocol": "websocket"}, "conv-2")
+
+
+async def test_peek_opening_greeting_dispatches_to_native_ws(monkeypatch):
+    import app.core.voice_native_ws as native_ws
+
+    async def fake_peek(agent, session_key):
+        return f"greeting for {session_key}"
+
+    monkeypatch.setattr(native_ws, "peek_greeting", fake_peek)
+
+    result = await voice_caller.peek_opening_greeting({"voice_protocol": "native_ws"}, "conv-42")
+    assert result == "greeting for conv-42"
+
+
+async def test_peek_opening_greeting_is_none_for_protocols_with_no_such_concept():
+    assert await voice_caller.peek_opening_greeting({"voice_protocol": "http_json"}, "c") is None
+    assert await voice_caller.peek_opening_greeting({"voice_protocol": "websocket"}, "c") is None
+    assert await voice_caller.peek_opening_greeting({"voice_protocol": "twilio"}, "c") is None
+    assert await voice_caller.peek_opening_greeting({}, "c") is None

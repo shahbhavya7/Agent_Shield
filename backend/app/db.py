@@ -176,6 +176,44 @@ def init_schema() -> None:
         -- which clear_messages() alone cannot prevent.
         CREATE UNIQUE INDEX IF NOT EXISTS messages_conv_turn_uq
             ON messages (conversation_id, turn_index);
+
+        -- The AI Caller: when set (non-empty), app.core.runner.run_scenario() plays this
+        -- scenario DYNAMICALLY — app.core.ai_caller generates one natural next utterance
+        -- per turn from this CUSTOMER context/behavior text + the live transcript,
+        -- instead of replaying seed_turns_json verbatim. This describes the SIMULATED
+        -- USER calling the agent under test — never the voice agent's own behavior — see
+        -- app.core.ai_caller's module docstring for the role separation this enforces.
+        -- NULL/empty (every scenario that predates this column) keeps running the
+        -- original scripted seed_turns path, unchanged.
+        --
+        -- Named customer_context (not "persona") deliberately: an earlier version of
+        -- this column WAS called persona, which reads ambiguously as "persona of the
+        -- voice agent" to anyone skimming the schema — renamed before any real run data
+        -- depended on the old name, so this is a straight add+drop, not a migration.
+        ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS customer_context TEXT;
+        ALTER TABLE scenarios DROP COLUMN IF EXISTS persona;
+        ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS customer_context TEXT;
+        ALTER TABLE test_cases DROP COLUMN IF EXISTS persona;
+
+        -- Dynamic-mode-only: caps how many caller<->agent exchanges the AI Caller gets
+        -- before the scenario ends regardless of outcome. NULL falls back to
+        -- app.core.runner.DEFAULT_MAX_TURNS. Meaningless (ignored) when customer_context
+        -- is empty.
+        ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS max_turns INTEGER;
+        ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS max_turns INTEGER;
+
+        -- Local filesystem path to this conversation's WAV recording (see
+        -- app.core.recording), if one was produced. NULL for every chat conversation
+        -- and any voice conversation that failed before its first turn's audio was
+        -- ever produced/received.
+        ALTER TABLE conversations ADD COLUMN IF NOT EXISTS recording_path TEXT;
+
+        -- True iff recording_path contains ONLY the agent's audio (native_ws — that
+        -- protocol drives the caller via text, so no real caller audio ever exists;
+        -- see app.core.recording's docstring). NULL/false for http_json/websocket/
+        -- twilio, which always represent both sides where recorded at all, and for
+        -- every conversation with no recording (meaningless there either way).
+        ALTER TABLE conversations ADD COLUMN IF NOT EXISTS recording_agent_only BOOLEAN;
         """
     )
     conn.commit()
@@ -417,11 +455,11 @@ def replace_scenarios(run_id: int, scenarios: list[dict]) -> list[int]:
         cur = conn.execute(
             """INSERT INTO scenarios
                (run_id, title, user_goal, test_type, assigned_fault,
-                expected_behavior, seed_turns_json)
-               VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                expected_behavior, seed_turns_json, customer_context, max_turns)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (run_id, s.get("title"), s.get("user_goal"), s.get("test_type"),
              s.get("assigned_fault"), s.get("expected_behavior"),
-             _json.dumps(s.get("seed_turns", []))),
+             _json.dumps(s.get("seed_turns", [])), s.get("customer_context"), s.get("max_turns")),
         )
         ids.append(cur.fetchone()["id"])
     conn.commit()
@@ -573,6 +611,23 @@ def update_conversation_fix(
     conn.close()
 
 
+def set_conversation_recording(conversation_id: int, path: str, agent_only: bool = False) -> None:
+    """Record where this conversation's WAV recording (app.core.recording) landed,
+    and whether it's agent-audio-only (native_ws — see that module's docstring).
+
+    Called exactly once, from app.core.voice_caller.close_voice_session(), only when
+    a recording actually has content to write — see that function and
+    app.core.recording.finalize_recording().
+    """
+    conn = get_conn()
+    conn.execute(
+        "UPDATE conversations SET recording_path = %s, recording_agent_only = %s WHERE id = %s",
+        (path, agent_only, conversation_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def build_conversation_payload(conversation_id: int) -> dict | None:
     """Assemble one conversation for the report: scenario meta + scores + messages+trace."""
     conv = get_conversation(conversation_id)
@@ -618,6 +673,17 @@ def build_conversation_payload(conversation_id: int) -> dict | None:
         "suggested_fix": conv.get("suggested_fix"),
         "evidence": conv.get("evidence"),
         "messages": messages,
+        # A ready-to-use URL, not the raw server filesystem path — GET it from
+        # app.routers.conversations. None whenever no recording exists (chat, or a
+        # voice conversation that failed before any audio was produced/received —
+        # see app.core.recording's docstring).
+        "recording_url": (
+            f"/conversations/{conv['id']}/recording" if conv.get("recording_path") else None
+        ),
+        # True iff recording_url, when present, contains ONLY the agent's audio
+        # (native_ws — see app.core.recording's docstring). Always False/irrelevant
+        # when recording_url is None.
+        "recording_agent_only": bool(conv.get("recording_agent_only")),
     }
 
 
@@ -792,11 +858,12 @@ def replace_test_cases(customer_agent_id: int, cases: list[dict], sources: list[
         conn.execute(
             """INSERT INTO test_cases
                (customer_agent_id, title, user_goal, test_type, assigned_fault,
-                expected_behavior, seed_turns_json, source, created_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                expected_behavior, seed_turns_json, source, created_at, customer_context, max_turns)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (customer_agent_id, tc.get("title"), tc.get("user_goal"), tc.get("test_type"),
              tc.get("assigned_fault"), tc.get("expected_behavior"),
-             _json.dumps(tc.get("seed_turns", [])), source, ts),
+             _json.dumps(tc.get("seed_turns", [])), source, ts,
+             tc.get("customer_context"), tc.get("max_turns")),
         )
     conn.commit()
     conn.close()

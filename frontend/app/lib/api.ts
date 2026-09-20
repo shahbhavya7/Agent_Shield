@@ -85,6 +85,17 @@ export interface Conversation {
   suggested_fix?: string | null;
   evidence?: string | null;
   messages: Message[];
+  // Set for any voice conversation that has a real recording — http_json/websocket/
+  // Twilio (both sides) and native_ws (agent audio only, see recording_agent_only
+  // below). null for chat, and for a voice conversation that failed before any
+  // audio existed. GET this path for the WAV.
+  recording_url?: string | null;
+  // True iff recording_url, when present, contains ONLY the agent's audio —
+  // native_ws, which drives the caller via text (see
+  // backend/app/core/recording.py's docstring): there's no real caller audio to
+  // include. Always false for http_json/websocket/Twilio, which represent both
+  // sides whenever they have a recording at all.
+  recording_agent_only?: boolean;
 }
 
 export interface Performance {
