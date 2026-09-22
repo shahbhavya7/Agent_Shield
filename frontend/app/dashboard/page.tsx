@@ -33,6 +33,7 @@ import {
   Check,
   Upload,
   FileText,
+  FileCode2,
   X,
   ListChecks,
   Plus,
@@ -343,9 +344,13 @@ export default function DashboardPage() {
   // that call (e.g. {"client": "acme"}), reusing endpoint_url as the HTTP base.
   const [voiceProtocol, setVoiceProtocol] = useState<"http_json" | "native_ws">("http_json");
   const [createCallBody, setCreateCallBody] = useState("");
-  // Knowledge source (priority): uploaded docs > free-text about > auto-discovery.
+  // Knowledge source — all optional, combined: uploaded docs + uploaded YAML config +
+  // free-text about, any/all/none of them. Auto-discovery is the fallback if nothing
+  // was given at all.
   const [knowledgeText, setKnowledgeText] = useState("");
   const [knowledgeFile, setKnowledgeFile] = useState("");
+  const [knowledgeYamlText, setKnowledgeYamlText] = useState("");
+  const [knowledgeYamlFile, setKnowledgeYamlFile] = useState("");
   const [aboutText, setAboutText] = useState("");
   const [detected, setDetected] = useState(""); // description AgentShield auto-discovered
 
@@ -360,6 +365,25 @@ export default function DashboardPage() {
     }
   };
   const clearUpload = () => { setKnowledgeText(""); setKnowledgeFile(""); };
+
+  const onUploadYaml = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      setKnowledgeYamlText(text.slice(0, MAX_KNOWLEDGE_CHARS));
+      setKnowledgeYamlFile(file.name);
+    } catch {
+      setError("Couldn't read that file — please use a YAML file.");
+    }
+  };
+  const clearUploadYaml = () => { setKnowledgeYamlText(""); setKnowledgeYamlFile(""); };
+
+  // What actually gets sent as "knowledge" to the backend — every uploaded source
+  // concatenated, since the generator/judge just treat it as one authoritative text block.
+  const combinedKnowledgeText = [knowledgeText, knowledgeYamlText]
+    .filter((t) => t.trim().length > 0)
+    .join("\n\n---\n\n");
+  const combinedKnowledgeName = [knowledgeFile, knowledgeYamlFile].filter(Boolean).join(" + ");
 
   const [verifyIndex, setVerifyIndex] = useState(0);
   const [selectedTests, setSelectedTests] = useState<string[]>(
@@ -453,7 +477,6 @@ export default function DashboardPage() {
   const canVerify =
     agentName.trim().length > 0 &&
     endpointUrl.trim().length > 0 &&
-    (knowledgeText.trim().length > 0 || aboutText.trim().length > 0) &&
     (modality !== "voice" || voiceProtocol !== "native_ws" || createCallBody.trim().length > 0);
   const canGenerate = selectedTests.length > 0 && !generating;
   const canRunTest = plannedScenarios > 0 && !starting && !generating;
@@ -608,10 +631,10 @@ export default function DashboardPage() {
             : undefined,
       });
       setAgentId(agent_id);
-      // Store the uploaded docs on the agent so every later run stays grounded on them.
-      if (knowledgeText.trim()) {
+      // Store the uploaded docs/YAML on the agent so every later run stays grounded on them.
+      if (combinedKnowledgeText.trim()) {
         try {
-          await saveAgentKnowledge(agent_id, knowledgeText, knowledgeFile);
+          await saveAgentKnowledge(agent_id, combinedKnowledgeText, combinedKnowledgeName);
         } catch {
           /* non-fatal — this run still grounds on the in-memory copy */
         }
@@ -621,8 +644,8 @@ export default function DashboardPage() {
       setVerifyIndex(3);
       const probe = await probeAgent(agent_id);
       if (!probe.ok) throw new Error(probe.error || "Endpoint did not return a valid response.");
-      // No docs and no description → AgentShield auto-discovers what the agent does.
-      if (!knowledgeText.trim() && !aboutText.trim()) {
+      // Nothing uploaded and no description → AgentShield auto-discovers what the agent does.
+      if (!combinedKnowledgeText.trim() && !aboutText.trim()) {
         try {
           const d = await discoverAgent(agent_id);
           setDetected(d.description);
@@ -661,7 +684,7 @@ export default function DashboardPage() {
     setGenerating(true);
     if (!regenerate) setStep("review");
     try {
-      const { scenarios } = await generateScenarios(agentId, selectedTypes(), guidance, knowledgeText);
+      const { scenarios } = await generateScenarios(agentId, selectedTypes(), guidance, combinedKnowledgeText);
       const fresh: ReviewCase[] = scenarios.map((sc) => ({ ...sc, uid: nextUid(), source: "ai" }));
       if (regenerate) {
         // Keep = add the new cases to the current ones; Replace = the new ones stand alone.
@@ -741,7 +764,7 @@ export default function DashboardPage() {
       );
       setSaving(false);
       const { group_id } = await createRunGroup(
-        batch, selectedTypes(), guidance, knowledgeText
+        batch, selectedTypes(), guidance, combinedKnowledgeText
       );
       setGroupId(group_id);
       setGroupRuns([]);
@@ -1112,10 +1135,10 @@ export default function DashboardPage() {
 
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">
-                      Agent knowledge <span className="text-[#F87171]">(required — upload docs or describe the agent)</span>
+                      Agent knowledge <span className="text-slate-600">(optional — upload docs, upload a YAML config, or describe the agent)</span>
                     </label>
 
-                    {/* Tier 1: upload docs */}
+                    {/* Tier 1a: upload docs */}
                     {!knowledgeFile ? (
                       <label className="mt-2 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-white/20 bg-white/2 px-4 py-4 text-sm text-slate-400 transition-colors hover:border-white/40 hover:text-[#F8FAFC]">
                         <Upload className="h-5 w-5 shrink-0" strokeWidth={1.5} />
@@ -1136,8 +1159,29 @@ export default function DashboardPage() {
                       </div>
                     )}
 
-                    {/* Tier 2: free-text about (only if no doc) */}
-                    {!knowledgeFile && (
+                    {/* Tier 1b: upload a YAML config — independent of the docs upload above */}
+                    {!knowledgeYamlFile ? (
+                      <label className="mt-3 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-white/20 bg-white/2 px-4 py-4 text-sm text-slate-400 transition-colors hover:border-white/40 hover:text-[#F8FAFC]">
+                        <FileCode2 className="h-5 w-5 shrink-0" strokeWidth={1.5} />
+                        <span>Upload a YAML config <span className="text-slate-600">(.yaml, .yml)</span></span>
+                        <input
+                          type="file"
+                          accept=".yaml,.yml"
+                          className="hidden"
+                          onChange={(e) => onUploadYaml(e.target.files?.[0])}
+                        />
+                      </label>
+                    ) : (
+                      <div className="mt-3 flex items-center gap-3 rounded-lg border border-[#34D399]/30 bg-[#34D399]/[0.06] px-4 py-3 text-sm">
+                        <FileCode2 className="h-5 w-5 shrink-0 text-[#34D399]" strokeWidth={1.5} />
+                        <span className="flex-1 truncate text-[#F8FAFC]">{knowledgeYamlFile}</span>
+                        <span className="text-xs text-slate-500">{knowledgeYamlText.length.toLocaleString()} chars</span>
+                        <button onClick={clearUploadYaml} className="text-slate-400 hover:text-[#F87171]"><X className="h-4 w-4" /></button>
+                      </div>
+                    )}
+
+                    {/* Tier 2: free-text about (only if nothing was uploaded) */}
+                    {!knowledgeFile && !knowledgeYamlFile && (
                       <textarea
                         value={aboutText}
                         onChange={(e) => setAboutText(e.target.value)}
@@ -1221,8 +1265,8 @@ export default function DashboardPage() {
                     <p className="font-heading text-lg font-medium text-[#F8FAFC]">{agentName || "Untitled Agent"}</p>
                     <p className="truncate text-xs text-slate-500">{PROVIDERS.find((p) => p.id === provider)?.label} · {endpointUrl}</p>
                     <p className="mt-1 text-xs text-[#67e8f9]">
-                      {knowledgeFile
-                        ? `📄 Tests grounded in uploaded docs: ${knowledgeFile}`
+                      {combinedKnowledgeName
+                        ? `📄 Tests grounded in uploaded ${combinedKnowledgeName}`
                         : aboutText.trim()
                         ? `📝 Profile: ${aboutText.trim()}`
                         : detected

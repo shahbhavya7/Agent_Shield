@@ -180,7 +180,10 @@ async def close_voice_session(agent: Any, session_key: Any) -> None:
     from app.core.recording import finalize_recording
 
     finalized = finalize_recording(session_key)
-    if finalized:
+    # Only a real scenario run's session_key is a conversations.id to attach this to —
+    # /agents/{id}/probe uses a synthetic "probe:{agent_id}:{uuid}" string key (see
+    # routers/agents.py) that was never a conversation row, so there's nothing to update.
+    if finalized and isinstance(session_key, int):
         from app.db import set_conversation_recording
 
         set_conversation_recording(session_key, finalized.path, agent_only=finalized.agent_only)
