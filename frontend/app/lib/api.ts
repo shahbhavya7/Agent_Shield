@@ -1,6 +1,6 @@
 // AgentShield API client — talks to the FastAPI backend.
 export const API_BASE =
-  (process.env.NEXT_PUBLIC_API_URL as string | undefined) || "http://localhost:8000";
+  (process.env.NEXT_PUBLIC_API_URL as string | undefined) || "http://localhost:8100";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -25,6 +25,7 @@ export interface Agent {
   id: number;
   name: string;
   kind: string;
+  modality?: "chat" | "voice";
   endpoint_url: string;
   response_path: string;
   description?: string | null;
@@ -84,6 +85,17 @@ export interface Conversation {
   suggested_fix?: string | null;
   evidence?: string | null;
   messages: Message[];
+  // Set for any voice conversation that has a real recording — http_json/websocket/
+  // Twilio (both sides) and native_ws (agent audio only, see recording_agent_only
+  // below). null for chat, and for a voice conversation that failed before any
+  // audio existed. GET this path for the WAV.
+  recording_url?: string | null;
+  // True iff recording_url, when present, contains ONLY the agent's audio —
+  // native_ws, which drives the caller via text (see
+  // backend/app/core/recording.py's docstring): there's no real caller audio to
+  // include. Always false for http_json/websocket/Twilio, which represent both
+  // sides whenever they have a recording at all.
+  recording_agent_only?: boolean;
 }
 
 export interface Performance {
@@ -161,6 +173,7 @@ export interface InventoryAgent {
   name: string;
   customer_agent_id: number | null;
   agent_id: number | null;
+  modality: "chat" | "voice";
 }
 
 export interface InventoryCustomer {
@@ -180,6 +193,11 @@ export function registerAgent(body: {
   request_template?: string;
   auth_header?: string | null;
   description?: string | null;
+  // "chat" (default) or "voice" — which execution path the Temporal workflow uses.
+  modality?: "chat" | "voice";
+  // Which wire protocol a voice-modality agent speaks. Ignored for chat. Defaults
+  // server-side to "http_json" when omitted.
+  voice_protocol?: "http_json" | "native_ws";
 }): Promise<{ agent_id: number }> {
   return req("/agents", { method: "POST", body: JSON.stringify(body) });
 }

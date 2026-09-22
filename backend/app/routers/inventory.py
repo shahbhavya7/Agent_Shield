@@ -32,6 +32,9 @@ def get_inventory() -> dict:
                 "name": name,
                 "customer_agent_id": combo["id"] if combo else None,
                 "agent_id": combo["agent_id"] if combo else None,
+                # Unregistered inventory.yaml entries (combo is None) have no agents row
+                # to read modality from yet — default to "chat", same as the DB column.
+                "modality": combo["agent_modality"] if combo else "chat",
             })
         customers.append({"name": c["name"], "agents": agents})
 
@@ -47,6 +50,7 @@ def get_inventory() -> dict:
             "name": agent_name,
             "customer_agent_id": combo["id"],
             "agent_id": combo["agent_id"],
+            "modality": combo["agent_modality"],
         })
     # dict order follows list_customer_agents()' ORDER BY, i.e. the order they were created.
     customers.extend({"name": name, "agents": agents} for name, agents in dynamic.items())

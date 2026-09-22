@@ -38,6 +38,7 @@ from app.core.judge import _endpoint_never_responded, judge_conversation
 from app.core.runner import run_scenario
 from app.core.scenarios import generate_scenarios
 from app.core.scoring import compute
+from app.core.voice_caller import call_voice_agent, close_voice_session, peek_opening_greeting
 from app.db import (
     get_agent,
     get_conversation,
@@ -122,13 +123,59 @@ async def play_scenario(run_id: int, scenario: dict, agent: dict) -> int:
 
 
 @activity.defn
+async def play_voice_scenario(run_id: int, scenario: dict, agent: dict) -> int:
+    """HTTP + TTS/STT + LLM + DB. Play one scenario against a voice-modality agent;
+    returns its conversation id.
+
+    Phase 2B: the scenario's turns are bridged onto a real voice-contract endpoint via
+    app.core.voice_caller.call_voice_agent — TTS the tester's text, POST the resulting
+    audio through the SAME black-box HTTP adapter chat uses, STT the agent's spoken
+    reply back to text. run_scenario() itself is unchanged and fully reused: only which
+    function plays a turn differs (`send_fn`), so persistence, idempotency, and turn
+    generation (scripted or dynamic) all behave identically to the chat path. The Judge,
+    Scoring, and Fixer only ever see the resulting text — they remain completely
+    unaware anything was ever audio.
+
+    Phase 3B: `close_fn=close_voice_session` is the GUARANTEED cleanup hook a
+    persistent Twilio/native_ws call/session needs (http_json/websocket ignore it — see
+    that function's docstring). Passed unconditionally, for every voice run, because it
+    is a no-op for every protocol that doesn't need it.
+
+    `greeting_fn=peek_opening_greeting` gives a DYNAMIC scenario (see app.core.ai_caller)
+    a chance to read native_ws's unprompted opening greeting before generating the AI
+    Caller's first line — also unconditional and a no-op for every other protocol, and
+    entirely unused by a scripted scenario regardless of protocol.
+    """
+    return await run_scenario(
+        run_id, scenario, agent,
+        idem_key=f"run:{run_id}:scenario:{scenario['_id']}:voice",
+        send_fn=call_voice_agent,
+        close_fn=close_voice_session,
+        greeting_fn=peek_opening_greeting,
+    )
+
+
+@activity.defn
 async def replay_scenario(run_id: int, scenario: dict, agent: dict) -> int:
     """HTTP + LLM + DB. Play a scenario as a deliberately NEW conversation.
 
     Unkeyed on purpose: replay exists to produce a second, independent conversation for
     a scenario that already has one, so the caller can compare before and after a fix.
+
+    Modality-aware for the same reason play_voice_scenario is: a voice agent's replay
+    must go through app.core.voice_caller (TTS/STT), or it would send raw text into a
+    `message` field that endpoint expects as base64 audio. `close_fn`/`greeting_fn`
+    follow the same modality-aware pattern as `send_fn` — None for chat, so both are
+    skipped entirely.
     """
-    return await run_scenario(run_id, scenario, agent, idem_key=None)
+    is_voice = agent.get("modality") == "voice"
+    send_fn = call_voice_agent if is_voice else None
+    close_fn = close_voice_session if is_voice else None
+    greeting_fn = peek_opening_greeting if is_voice else None
+    return await run_scenario(
+        run_id, scenario, agent, idem_key=None,
+        send_fn=send_fn, close_fn=close_fn, greeting_fn=greeting_fn,
+    )
 
 
 @activity.defn

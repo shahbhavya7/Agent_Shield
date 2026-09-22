@@ -19,9 +19,14 @@ type Combo = {
   agentId: number | null;
 };
 
-function toCombos(inventory: Inventory): Combo[] {
-  return inventory.customers.flatMap((c) =>
-    c.agents.map((a, i) => ({
+// Only agents of the modality being tested belong on this page — a chat agent's HTTP
+// endpoint can't hold a voice conversation and vice versa, so cross-modality entries are
+// filtered out here (before indexing for `firstOfCustomer`, so the customer-group divider
+// still lands on the first row actually shown).
+function toCombos(inventory: Inventory, modality: "chat" | "voice"): Combo[] {
+  return inventory.customers.flatMap((c) => {
+    const agents = c.agents.filter((a) => a.modality === modality);
+    return agents.map((a, i) => ({
       id: `${c.name}::${a.key}`,
       customer: c.name,
       agentKey: a.key,
@@ -29,8 +34,8 @@ function toCombos(inventory: Inventory): Combo[] {
       firstOfCustomer: i === 0,
       customerAgentId: a.customer_agent_id,
       agentId: a.agent_id,
-    }))
-  );
+    }));
+  });
 }
 
 export default function ExistingAgent() {
@@ -38,11 +43,17 @@ export default function ExistingAgent() {
   const [selected, setSelected] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Carried in from /test via /start?modality=... — defaults to "chat" so a direct
+  // link to this page (no modality chosen) behaves exactly as it always has.
+  const [modality, setModality] = useState<"chat" | "voice">("chat");
   const router = useRouter();
 
   useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("modality");
+    const mod = q === "voice" ? "voice" : "chat";
+    setModality(mod);
     getInventory()
-      .then((inv) => setCombos(toCombos(inv)))
+      .then((inv) => setCombos(toCombos(inv, mod)))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
   }, []);
@@ -78,6 +89,7 @@ export default function ExistingAgent() {
       agent: String(first.agentId),
       customer: first.customer,
       agentName: first.agentName,
+      modality,
     });
     router.push(`/dashboard?${params.toString()}`);
   };
@@ -100,7 +112,7 @@ export default function ExistingAgent() {
             <span className="font-logo text-lg font-extrabold tracking-tight text-[#F8FAFC]">AgentShield</span>
           </Link>
           <Link
-            href="/start"
+            href={`/start?modality=${modality}`}
             className="flex items-center gap-2 rounded-full border border-white/12 bg-white/2 px-5 py-2.5 text-sm font-medium text-[#F8FAFC] backdrop-blur-md transition-all duration-300 hover:border-white/[0.16] hover:bg-white/4"
           >
             <ArrowLeft className="h-4 w-4" strokeWidth={1.5} />
@@ -115,7 +127,10 @@ export default function ExistingAgent() {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.5, ease: "easeOut" }}
         >
-          <div className="flex items-center gap-3">
+          <span className="inline-flex items-center gap-2 rounded-full border border-white/12 bg-white/2 px-4 py-1.5 text-xs font-medium text-[#9CA3AF] backdrop-blur-md">
+            Testing: {modality === "voice" ? "Voice Agent" : "Chat Agent"}
+          </span>
+          <div className="mt-4 flex items-center gap-3">
             <div className="flex h-11 w-11 items-center justify-center rounded-lg border border-white/20 bg-white/4 text-slate-200">
               <ListChecks className="h-5 w-5" strokeWidth={1.5} />
             </div>
@@ -154,7 +169,11 @@ export default function ExistingAgent() {
                 {!loading && combos.length === 0 && !error && (
                   <tr>
                     <td colSpan={3} className="px-6 py-8 text-center text-[#9CA3AF]">
-                      No onboarded agents found in inventory.yaml.
+                      No onboarded {modality} agents found. Try{" "}
+                      <Link href={`/start?modality=${modality}`} className="underline hover:text-[#F8FAFC]">
+                        connecting a new one
+                      </Link>
+                      .
                     </td>
                   </tr>
                 )}

@@ -48,7 +48,7 @@ code, its prompts, or its weights — just the endpoint.
                │ REST + polling                          │ black-box HTTP
                ▼                                          │ (adapter only)
 ┌───────────────────────────────────────────────────────┴──────────────┐
-│  BACKEND (FastAPI :8000, PostgreSQL, asyncio)                          │
+│  BACKEND (FastAPI :8100, PostgreSQL, asyncio)                          │
 │  Submits each run as a Temporal workflow. Per agent, the workflow:    │
 │    generate/reuse test cases → break agent (faults+trace) → judge →   │
 │    (fail only) explain+fix → score → report                           │
@@ -76,7 +76,7 @@ code, its prompts, or its weights — just the endpoint.
   and development test genuinely non-deterministic agents, not scripted mocks — and the
   same pipeline works against any third-party HTTP endpoint.
 
-**Ports:** frontend `3000`, backend `8000`, Temporal server `7233` (Web UI `8233`), sample
+**Ports:** frontend `3000`, backend `8100`, Temporal server `7233` (Web UI `8233`), sample
 agents `8002`–`8007`. One command starts all of it: `./run_all.sh`.
 
 ---
@@ -300,7 +300,7 @@ Next.js (App Router) + Tailwind + framer-motion + lucide-react, under `frontend/
   `saveAgentKnowledge`, `generateScenarios`, `generateOneScenario`, `saveTestCases`,
   `createRun`, `createRunGroup`, `getRun`, `getRunGroup`, `getReport`, `getGroupReport`,
   `getDemoReport`, `getInventory`, `getStoredTestCases`, plus all the TS types. Base URL
-  from `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`).
+  from `NEXT_PUBLIC_API_URL` (default `http://localhost:8100`).
 - **`app/dashboard/page.tsx`** — the **wizard** (the whole product UX), a client component
   stepping through `connect → verifying → configure → review → running → results`.
 
@@ -447,7 +447,7 @@ needed even once Postgres and Temporal were added.
 ```bash
 ./run_all.sh
 ```
-Starts the backend (`:8000`), all 6 sample agents (`:8002`–`:8007`), the Temporal dev
+Starts the backend (`:8100`), all 6 sample agents (`:8002`–`:8007`), the Temporal dev
 server + worker (if the `temporal` CLI is installed), and the frontend (`:3000`). Ctrl-C
 stops all of it. See `README.md` for prerequisites (PostgreSQL, the Temporal CLI, an
 OpenAI key) and running pieces by hand instead.

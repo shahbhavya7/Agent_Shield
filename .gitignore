@@ -1,1 +1,4 @@
 /frontend_vite_legacy
+
+# Docker-only env (real secrets/creds) — docker/.env.example is the tracked template.
+/docker/.env

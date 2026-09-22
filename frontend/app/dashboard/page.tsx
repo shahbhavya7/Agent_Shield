@@ -33,6 +33,7 @@ import {
   Check,
   Upload,
   FileText,
+  FileCode2,
   X,
   ListChecks,
   Plus,
@@ -40,8 +41,11 @@ import {
   Trash2,
   Wand2,
   Save,
+  MessageSquare,
+  Mic,
 } from "lucide-react";
 import {
+  API_BASE,
   createRunGroup,
   discoverAgent,
   generateScenarios,
@@ -73,6 +77,7 @@ const PROVIDERS = [
 
 // Each UI category maps to one of the backend test_type keys.
 const TEST_CATEGORIES = [
+  { label: "Happy Path", icon: CheckCircle2, type: "happy_path" },
   { label: "Prompt Injection", icon: ShieldAlert, type: "injection" },
   { label: "Hallucination", icon: AlertTriangle, type: "hallucination" },
   { label: "Tool Failure", icon: Wrench, type: "support" },
@@ -176,6 +181,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function prettify(type?: string): string {
   const map: Record<string, string> = {
+    happy_path: "Happy Path",
     support: "Tool / Support",
     injection: "Prompt Injection",
     hallucination: "Hallucination",
@@ -237,15 +243,61 @@ function Transcript({ messages }: { messages: Message[] }) {
   );
 }
 
-function TranscriptDetails({ messages, label }: { messages: Message[]; label: string }) {
+// Reuses the SAME `messages`/verdict data the transcript already renders from —
+// recording_url is just one more field on that same conversation payload
+// (backend/app/db.py's build_conversation_payload), nothing new fetched here.
+function RecordingPlayer({
+  url,
+  agentOnly,
+}: {
+  url: string | null | undefined;
+  agentOnly?: boolean;
+}) {
+  if (!url) {
+    return (
+      <p className="mt-3 flex items-center gap-1.5 text-xs text-slate-500">
+        <Mic className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+        No recording available
+      </p>
+    );
+  }
   return (
-    <details className="group mt-4">
-      <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-slate-400 transition-colors hover:text-slate-200">
-        <ArrowRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
-        {label}
-      </summary>
-      <Transcript messages={messages} />
-    </details>
+    <div className="mt-3">
+      <div className="flex items-center gap-2">
+        <Mic className="h-3.5 w-3.5 shrink-0 text-slate-400" strokeWidth={1.5} />
+        <audio controls preload="none" src={`${API_BASE}${url}`} className="h-8 w-full max-w-sm" />
+      </div>
+      {agentOnly && (
+        <p className="mt-1.5 pl-5 text-[11px] text-slate-500">
+          Agent audio only — this protocol drives the caller via text, so no caller audio exists.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function TranscriptDetails({
+  messages,
+  label,
+  recordingUrl,
+  recordingAgentOnly,
+}: {
+  messages: Message[];
+  label: string;
+  recordingUrl?: string | null;
+  recordingAgentOnly?: boolean;
+}) {
+  return (
+    <>
+      <RecordingPlayer url={recordingUrl} agentOnly={recordingAgentOnly} />
+      <details className="group mt-2">
+        <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-slate-400 transition-colors hover:text-slate-200">
+          <ArrowRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+          {label}
+        </summary>
+        <Transcript messages={messages} />
+      </details>
+    </>
   );
 }
 
@@ -274,14 +326,31 @@ export default function DashboardPage() {
   const router = useRouter();
   const [step, setStep] = useState<Step>("connect");
 
-  // Prefilled to our sample RAG agent so the demo is one click.
+  // Which kind of agent this run is testing — carried in from /test via
+  // /start?modality=... (and from there into /existing-agent and here). Defaults to
+  // "chat" so every existing entry point that doesn't pass it behaves exactly as before.
+  const [modality, setModality] = useState<"chat" | "voice">("chat");
+
+  // Prefilled to our sample RAG agent so the chat demo is one click. Left blank for
+  // voice, since there's no sample voice agent wired up yet.
   const [agentName, setAgentName] = useState("Store Support Agent (RAG)");
   const [endpointUrl, setEndpointUrl] = useState("http://localhost:8002/chat");
   const [apiKey, setApiKey] = useState("");
   const [provider, setProvider] = useState("openai");
-  // Knowledge source (priority): uploaded docs > free-text about > auto-discovery.
+  // Voice-modality only: which wire protocol the agent speaks. "http_json" (default)
+  // TTS/STTs through the same black-box HTTP adapter chat agents use. "native_ws"
+  // holds one WebSocket open for the whole scenario against a target that speaks its
+  // own call-session protocol directly — createCallBody is the JSON POSTed to create
+  // that call (e.g. {"client": "acme"}), reusing endpoint_url as the HTTP base.
+  const [voiceProtocol, setVoiceProtocol] = useState<"http_json" | "native_ws">("http_json");
+  const [createCallBody, setCreateCallBody] = useState("");
+  // Knowledge source — all optional, combined: uploaded docs + uploaded YAML config +
+  // free-text about, any/all/none of them. Auto-discovery is the fallback if nothing
+  // was given at all.
   const [knowledgeText, setKnowledgeText] = useState("");
   const [knowledgeFile, setKnowledgeFile] = useState("");
+  const [knowledgeYamlText, setKnowledgeYamlText] = useState("");
+  const [knowledgeYamlFile, setKnowledgeYamlFile] = useState("");
   const [aboutText, setAboutText] = useState("");
   const [detected, setDetected] = useState(""); // description AgentShield auto-discovered
 
@@ -296,6 +365,25 @@ export default function DashboardPage() {
     }
   };
   const clearUpload = () => { setKnowledgeText(""); setKnowledgeFile(""); };
+
+  const onUploadYaml = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      setKnowledgeYamlText(text.slice(0, MAX_KNOWLEDGE_CHARS));
+      setKnowledgeYamlFile(file.name);
+    } catch {
+      setError("Couldn't read that file — please use a YAML file.");
+    }
+  };
+  const clearUploadYaml = () => { setKnowledgeYamlText(""); setKnowledgeYamlFile(""); };
+
+  // What actually gets sent as "knowledge" to the backend — every uploaded source
+  // concatenated, since the generator/judge just treat it as one authoritative text block.
+  const combinedKnowledgeText = [knowledgeText, knowledgeYamlText]
+    .filter((t) => t.trim().length > 0)
+    .join("\n\n---\n\n");
+  const combinedKnowledgeName = [knowledgeFile, knowledgeYamlFile].filter(Boolean).join(" + ");
 
   const [verifyIndex, setVerifyIndex] = useState(0);
   const [selectedTests, setSelectedTests] = useState<string[]>(
@@ -389,7 +477,7 @@ export default function DashboardPage() {
   const canVerify =
     agentName.trim().length > 0 &&
     endpointUrl.trim().length > 0 &&
-    (knowledgeText.trim().length > 0 || aboutText.trim().length > 0);
+    (modality !== "voice" || voiceProtocol !== "native_ws" || createCallBody.trim().length > 0);
   const canGenerate = selectedTests.length > 0 && !generating;
   const canRunTest = plannedScenarios > 0 && !starting && !generating;
   const aiCount = testCases.filter((c) => c.source === "ai").length;
@@ -400,11 +488,13 @@ export default function DashboardPage() {
 
   // "Run New Test" sends the user back to the start choice (new agent vs existing agent).
   const handleReset = () => {
-    router.push("/start");
+    router.push(`/start?modality=${modality}`);
     setTargets([]);
     setActiveIdx(0);
     setStep("connect");
     setApiKey("");
+    setVoiceProtocol("http_json");
+    setCreateCallBody("");
     setKnowledgeText("");
     setKnowledgeFile("");
     setAboutText("");
@@ -426,6 +516,20 @@ export default function DashboardPage() {
     setSaving(false);
     setSavedNote(null);
   };
+
+  // --- Modality: which kind of agent this run tests ---
+  // Read once on mount, same "manual window.location.search" convention as the target
+  // parsing below (kept separate from it since modality applies on every entry path,
+  // including "connect a new agent", where the targets effect returns early).
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("modality");
+    if (q !== "voice") return;
+    setModality("voice");
+    // The chat defaults point at our sample RAG bot, which only speaks text — clear
+    // them rather than prefill a voice run with an endpoint that can't work.
+    setAgentName("");
+    setEndpointUrl("");
+  }, []);
 
   // --- Existing Agent Testing entry ---
   // ?targets=<json list of {ca,agent,customer,agentName}> for one or many agents, or the
@@ -519,12 +623,18 @@ export default function DashboardPage() {
         response_path: "reply",
         auth_header: auth,
         description: aboutText.trim() || undefined,
+        modality,
+        voice_protocol: modality === "voice" ? voiceProtocol : undefined,
+        request_template:
+          modality === "voice" && voiceProtocol === "native_ws"
+            ? createCallBody.trim()
+            : undefined,
       });
       setAgentId(agent_id);
-      // Store the uploaded docs on the agent so every later run stays grounded on them.
-      if (knowledgeText.trim()) {
+      // Store the uploaded docs/YAML on the agent so every later run stays grounded on them.
+      if (combinedKnowledgeText.trim()) {
         try {
-          await saveAgentKnowledge(agent_id, knowledgeText, knowledgeFile);
+          await saveAgentKnowledge(agent_id, combinedKnowledgeText, combinedKnowledgeName);
         } catch {
           /* non-fatal — this run still grounds on the in-memory copy */
         }
@@ -534,8 +644,8 @@ export default function DashboardPage() {
       setVerifyIndex(3);
       const probe = await probeAgent(agent_id);
       if (!probe.ok) throw new Error(probe.error || "Endpoint did not return a valid response.");
-      // No docs and no description → AgentShield auto-discovers what the agent does.
-      if (!knowledgeText.trim() && !aboutText.trim()) {
+      // Nothing uploaded and no description → AgentShield auto-discovers what the agent does.
+      if (!combinedKnowledgeText.trim() && !aboutText.trim()) {
         try {
           const d = await discoverAgent(agent_id);
           setDetected(d.description);
@@ -574,7 +684,7 @@ export default function DashboardPage() {
     setGenerating(true);
     if (!regenerate) setStep("review");
     try {
-      const { scenarios } = await generateScenarios(agentId, selectedTypes(), guidance, knowledgeText);
+      const { scenarios } = await generateScenarios(agentId, selectedTypes(), guidance, combinedKnowledgeText);
       const fresh: ReviewCase[] = scenarios.map((sc) => ({ ...sc, uid: nextUid(), source: "ai" }));
       if (regenerate) {
         // Keep = add the new cases to the current ones; Replace = the new ones stand alone.
@@ -654,7 +764,7 @@ export default function DashboardPage() {
       );
       setSaving(false);
       const { group_id } = await createRunGroup(
-        batch, selectedTypes(), guidance, knowledgeText
+        batch, selectedTypes(), guidance, combinedKnowledgeText
       );
       setGroupId(group_id);
       setGroupRuns([]);
@@ -818,6 +928,8 @@ export default function DashboardPage() {
         fix: c.suggested_fix || "",
         evidence: c.evidence || "",
         messages: c.messages || [],
+        recordingUrl: c.recording_url || null,
+        recordingAgentOnly: !!c.recording_agent_only,
       }));
   }, [report]);
 
@@ -828,6 +940,8 @@ export default function DashboardPage() {
         scenario: c.scenario_title || "Untitled scenario",
         category: prettify(c.test_type),
         messages: c.messages || [],
+        recordingUrl: c.recording_url || null,
+        recordingAgentOnly: !!c.recording_agent_only,
       }));
   }, [report]);
 
@@ -874,6 +988,10 @@ export default function DashboardPage() {
               <ShieldCheck className="h-5 w-5" strokeWidth={1.5} />
             </div>
             <span className="font-logo text-lg font-extrabold tracking-tight text-[#F8FAFC]">AgentShield</span>
+            <span className="ml-2 hidden items-center gap-1.5 rounded-full border border-white/12 bg-white/2 px-3 py-1 text-xs font-medium text-[#9CA3AF] sm:inline-flex">
+              {modality === "voice" ? <Mic className="h-3 w-3" strokeWidth={1.5} /> : <MessageSquare className="h-3 w-3" strokeWidth={1.5} />}
+              {modality === "voice" ? "Voice Agent" : "Chat Agent"}
+            </span>
           </Link>
 
           {step === "results" ? (
@@ -924,9 +1042,13 @@ export default function DashboardPage() {
           {step === "connect" && (
             <motion.section key="connect" {...fadeStep} className="mt-10 flex justify-center">
               <div className="w-full max-w-2xl rounded-xl border border-white/12 bg-white/2 p-10 backdrop-blur-md">
-                <h2 className="font-heading text-2xl font-medium text-[#F8FAFC]">Connect Your AI Agent</h2>
+                <h2 className="font-heading text-2xl font-medium text-[#F8FAFC]">
+                  {modality === "voice" ? "Connect Your Voice Agent" : "Connect Your AI Agent"}
+                </h2>
                 <p className="mt-2 text-sm text-[#9CA3AF]">
-                  Point AgentShield at any agent&apos;s HTTP endpoint. (Prefilled with our sample RAG agent.)
+                  {modality === "voice"
+                    ? "Point AgentShield at your voice agent's HTTP endpoint. Running it locally? Expose it with a tunnel like ngrok and paste the public URL below."
+                    : "Point AgentShield at any agent's HTTP endpoint. (Prefilled with our sample RAG agent.)"}
                 </p>
 
                 <div className="mt-8 flex flex-col gap-5">
@@ -939,12 +1061,69 @@ export default function DashboardPage() {
                   </div>
 
                   <div>
-                    <label className="text-xs font-medium text-[#9CA3AF]">Endpoint URL</label>
+                    <label className="text-xs font-medium text-[#9CA3AF]">
+                      {modality === "voice" ? "Voice Agent Endpoint URL" : "Endpoint URL"}
+                    </label>
                     <div className="mt-2 flex items-center gap-3 rounded-lg border border-white/12 bg-white/2 px-4 py-3 transition-colors duration-300 focus-within:border-white/30">
                       <Link2 className="h-4 w-4 shrink-0 text-slate-400" strokeWidth={1.5} />
-                      <input value={endpointUrl} onChange={(e) => setEndpointUrl(e.target.value)} placeholder="https://api.example.com/v1/agent" className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600" />
+                      <input
+                        value={endpointUrl}
+                        onChange={(e) => setEndpointUrl(e.target.value)}
+                        placeholder={modality === "voice" ? "https://<your-ngrok-subdomain>.ngrok.io/voice-chat" : "https://api.example.com/v1/agent"}
+                        className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600"
+                      />
                     </div>
                   </div>
+
+                  {modality === "voice" && (
+                    <div>
+                      <label className="text-xs font-medium text-[#9CA3AF]">Voice Protocol</label>
+                      <div className="mt-2 grid grid-cols-2 gap-3">
+                        {(
+                          [
+                            { id: "http_json" as const, label: "HTTP (TTS / STT)" },
+                            { id: "native_ws" as const, label: "Native WebSocket" },
+                          ]
+                        ).map((p) => {
+                          const active = voiceProtocol === p.id;
+                          return (
+                            <button
+                              key={p.id}
+                              onClick={() => setVoiceProtocol(p.id)}
+                              className={`rounded-lg border px-3 py-3 text-xs font-medium transition-all duration-300 ${
+                                active ? "border-white/50 bg-white/10 text-[#F8FAFC] shadow-[0_0_20px_rgba(255,255,255,0.15)]" : "border-white/10 bg-white/2 text-slate-400 hover:border-white/20 hover:text-[#F8FAFC]"
+                              }`}
+                            >
+                              {p.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p className="mt-2 text-xs text-slate-500">
+                        {voiceProtocol === "http_json"
+                          ? "One HTTP call per turn — AgentShield speaks the audio (TTS in, STT out)."
+                          : "One persistent WebSocket for the whole scenario, against an agent that speaks its own call-session protocol (e.g. create-a-call + simulated_utterance)."}
+                      </p>
+
+                      {voiceProtocol === "native_ws" && (
+                        <div className="mt-3">
+                          <label className="text-xs font-medium text-[#9CA3AF]">Create-call request body (JSON)</label>
+                          <div className="mt-2 flex items-center gap-3 rounded-lg border border-white/12 bg-white/2 px-4 py-3 transition-colors duration-300 focus-within:border-white/30">
+                            <Link2 className="h-4 w-4 shrink-0 text-slate-400" strokeWidth={1.5} />
+                            <input
+                              value={createCallBody}
+                              onChange={(e) => setCreateCallBody(e.target.value)}
+                              placeholder='{"client": "your_client_slug"}'
+                              className="w-full bg-transparent text-sm text-[#F8FAFC] outline-none placeholder:text-slate-600"
+                            />
+                          </div>
+                          <p className="mt-1 text-xs text-slate-500">
+                            POSTed to {"{"}Endpoint URL{"}"}/api/calls to create the call; the returned call_id opens the WebSocket at {"{"}Endpoint URL, ws(s)://{"}"}/api/ws/{"{"}call_id{"}"}.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">API Key <span className="text-slate-600">(optional)</span></label>
@@ -956,10 +1135,10 @@ export default function DashboardPage() {
 
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">
-                      Agent knowledge <span className="text-[#F87171]">(required — upload docs or describe the agent)</span>
+                      Agent knowledge <span className="text-slate-600">(optional — upload docs, upload a YAML config, or describe the agent)</span>
                     </label>
 
-                    {/* Tier 1: upload docs */}
+                    {/* Tier 1a: upload docs */}
                     {!knowledgeFile ? (
                       <label className="mt-2 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-white/20 bg-white/2 px-4 py-4 text-sm text-slate-400 transition-colors hover:border-white/40 hover:text-[#F8FAFC]">
                         <Upload className="h-5 w-5 shrink-0" strokeWidth={1.5} />
@@ -980,8 +1159,29 @@ export default function DashboardPage() {
                       </div>
                     )}
 
-                    {/* Tier 2: free-text about (only if no doc) */}
-                    {!knowledgeFile && (
+                    {/* Tier 1b: upload a YAML config — independent of the docs upload above */}
+                    {!knowledgeYamlFile ? (
+                      <label className="mt-3 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-white/20 bg-white/2 px-4 py-4 text-sm text-slate-400 transition-colors hover:border-white/40 hover:text-[#F8FAFC]">
+                        <FileCode2 className="h-5 w-5 shrink-0" strokeWidth={1.5} />
+                        <span>Upload a YAML config <span className="text-slate-600">(.yaml, .yml)</span></span>
+                        <input
+                          type="file"
+                          accept=".yaml,.yml"
+                          className="hidden"
+                          onChange={(e) => onUploadYaml(e.target.files?.[0])}
+                        />
+                      </label>
+                    ) : (
+                      <div className="mt-3 flex items-center gap-3 rounded-lg border border-[#34D399]/30 bg-[#34D399]/[0.06] px-4 py-3 text-sm">
+                        <FileCode2 className="h-5 w-5 shrink-0 text-[#34D399]" strokeWidth={1.5} />
+                        <span className="flex-1 truncate text-[#F8FAFC]">{knowledgeYamlFile}</span>
+                        <span className="text-xs text-slate-500">{knowledgeYamlText.length.toLocaleString()} chars</span>
+                        <button onClick={clearUploadYaml} className="text-slate-400 hover:text-[#F87171]"><X className="h-4 w-4" /></button>
+                      </div>
+                    )}
+
+                    {/* Tier 2: free-text about (only if nothing was uploaded) */}
+                    {!knowledgeFile && !knowledgeYamlFile && (
                       <textarea
                         value={aboutText}
                         onChange={(e) => setAboutText(e.target.value)}
@@ -1065,8 +1265,8 @@ export default function DashboardPage() {
                     <p className="font-heading text-lg font-medium text-[#F8FAFC]">{agentName || "Untitled Agent"}</p>
                     <p className="truncate text-xs text-slate-500">{PROVIDERS.find((p) => p.id === provider)?.label} · {endpointUrl}</p>
                     <p className="mt-1 text-xs text-[#67e8f9]">
-                      {knowledgeFile
-                        ? `📄 Tests grounded in uploaded docs: ${knowledgeFile}`
+                      {combinedKnowledgeName
+                        ? `📄 Tests grounded in uploaded ${combinedKnowledgeName}`
                         : aboutText.trim()
                         ? `📝 Profile: ${aboutText.trim()}`
                         : detected
@@ -1581,6 +1781,8 @@ export default function DashboardPage() {
                         <TranscriptDetails
                           messages={row.messages}
                           label={`View what AgentShield asked & how it broke (${row.messages.length} turns)`}
+                          recordingUrl={row.recordingUrl}
+                          recordingAgentOnly={row.recordingAgentOnly}
                         />
                       </div>
                     ))}
@@ -1636,7 +1838,12 @@ export default function DashboardPage() {
                             {row.category}
                           </span>
                         </div>
-                        <TranscriptDetails messages={row.messages} label={`View transcript & trace (${row.messages.length} turns)`} />
+                        <TranscriptDetails
+                          messages={row.messages}
+                          label={`View transcript & trace (${row.messages.length} turns)`}
+                          recordingUrl={row.recordingUrl}
+                          recordingAgentOnly={row.recordingAgentOnly}
+                        />
                       </div>
                     ))}
                   </div>

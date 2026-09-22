@@ -18,6 +18,15 @@ DATABASE_URL: str = os.getenv(
     "DATABASE_URL", "postgresql://localhost:5432/agentshield"
 )
 
+# --- Recordings ---------------------------------------------------------------
+# Where app.core.recording writes one WAV file per completed voice conversation,
+# reusing the real audio already produced/transmitted by the voice pipeline (see
+# that module's docstring for exactly what is and isn't captured per protocol).
+# Local disk only, no cloud storage — override via env for a different mount/volume.
+RECORDINGS_DIR: str = os.getenv(
+    "RECORDINGS_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "recordings")
+)
+
 # Demo safety: cap scenarios per run so a live run finishes well under ~90s.
 MAX_SCENARIOS: int = int(os.getenv("MAX_SCENARIOS", "10"))
 
@@ -61,6 +70,24 @@ WORKFLOW_TASK_CONCURRENCY: int = int(os.getenv("WORKFLOW_TASK_CONCURRENCY", "100
 # Rough $ per 1K tokens for the agent-under-test, used to estimate run cost.
 # Default is a blended gpt-4o-mini rate; override per model via .env.
 PRICE_PER_1K_TOKENS: float = float(os.getenv("PRICE_PER_1K_TOKENS", "0.0004"))
+
+# --- Voice (Phase 2B: AI Caller) ---------------------------------------------
+# STT/TTS models app.core.voice_caller uses to bridge a text scenario turn onto a real
+# voice-contract endpoint. Same OpenAI vendor as every other model call in this app —
+# no new provider. Defaults match backend/sample_voice_bot's own defaults.
+VOICE_STT_MODEL: str = os.getenv("VOICE_STT_MODEL", "whisper-1")
+VOICE_TTS_MODEL: str = os.getenv("VOICE_TTS_MODEL", "tts-1")
+VOICE_TTS_VOICE: str = os.getenv("VOICE_TTS_VOICE", "alloy")
+
+# --- Voice (Phase 3A: Twilio, one call per turn) ------------------------------
+# Twilio account credentials + the number AgentShield places outbound test calls
+# from. PUBLIC_BASE_URL is AgentShield's OWN publicly reachable address (e.g. an
+# ngrok URL in dev) — Twilio calls back to it (webhook + Media Stream), the reverse
+# direction from every other transport, which always calls OUT to the agent.
+TWILIO_ACCOUNT_SID: str = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN: str = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER: str = os.getenv("TWILIO_FROM_NUMBER", "")
+PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
 
 # --- Agent name mapping (backend/mapping.yaml) -------------------------------
 # Maps the internal agent identifier used in the repo (Domain.key, or the module name

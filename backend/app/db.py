@@ -137,6 +137,30 @@ def init_schema() -> None:
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge TEXT;
         ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge_name TEXT;
 
+        -- Which testing modality this agent is: chat (default, text/HTTP) or voice.
+        -- The Temporal workflow reads this to pick play_scenario vs play_voice_scenario.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS modality TEXT NOT NULL DEFAULT 'chat';
+
+        -- Which wire protocol a voice-modality agent speaks. Only 'http_json' (the
+        -- existing TTS -> adapter.send() -> STT contract) is implemented today;
+        -- 'websocket' and 'twilio' are recognized names app.core.voice_caller rejects
+        -- with a controlled error until a later phase implements them. Meaningless for
+        -- modality='chat'. Defaulted so every existing agent keeps working unchanged.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS voice_protocol TEXT NOT NULL DEFAULT 'http_json';
+
+        -- Which HTTP verb the adapter uses to call endpoint_url. 'POST' (default) sends
+        -- request_template as the JSON body, unchanged from before this column existed.
+        -- 'GET' sends message/history/faults as query parameters instead (see
+        -- query_param_map) for black-box agents whose API only accepts GET.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS http_method TEXT NOT NULL DEFAULT 'POST';
+
+        -- Only meaningful when http_method='GET'. JSON object mapping the semantic
+        -- fields the adapter knows about ("message", "history", "faults") to the actual
+        -- query parameter names the target agent expects, e.g. '{"message":"q"}'. A
+        -- field omitted from the map is simply not sent. NULL/empty falls back to
+        -- app.core.adapter.DEFAULT_QUERY_PARAM_MAP.
+        ALTER TABLE agents ADD COLUMN IF NOT EXISTS query_param_map TEXT;
+
         -- Idempotency, so a re-executed unit of work converges on the same rows instead
         -- of appending new ones. This is the precondition for turning on retries.
         --
@@ -152,6 +176,44 @@ def init_schema() -> None:
         -- which clear_messages() alone cannot prevent.
         CREATE UNIQUE INDEX IF NOT EXISTS messages_conv_turn_uq
             ON messages (conversation_id, turn_index);
+
+        -- The AI Caller: when set (non-empty), app.core.runner.run_scenario() plays this
+        -- scenario DYNAMICALLY — app.core.ai_caller generates one natural next utterance
+        -- per turn from this CUSTOMER context/behavior text + the live transcript,
+        -- instead of replaying seed_turns_json verbatim. This describes the SIMULATED
+        -- USER calling the agent under test — never the voice agent's own behavior — see
+        -- app.core.ai_caller's module docstring for the role separation this enforces.
+        -- NULL/empty (every scenario that predates this column) keeps running the
+        -- original scripted seed_turns path, unchanged.
+        --
+        -- Named customer_context (not "persona") deliberately: an earlier version of
+        -- this column WAS called persona, which reads ambiguously as "persona of the
+        -- voice agent" to anyone skimming the schema — renamed before any real run data
+        -- depended on the old name, so this is a straight add+drop, not a migration.
+        ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS customer_context TEXT;
+        ALTER TABLE scenarios DROP COLUMN IF EXISTS persona;
+        ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS customer_context TEXT;
+        ALTER TABLE test_cases DROP COLUMN IF EXISTS persona;
+
+        -- Dynamic-mode-only: caps how many caller<->agent exchanges the AI Caller gets
+        -- before the scenario ends regardless of outcome. NULL falls back to
+        -- app.core.runner.DEFAULT_MAX_TURNS. Meaningless (ignored) when customer_context
+        -- is empty.
+        ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS max_turns INTEGER;
+        ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS max_turns INTEGER;
+
+        -- Local filesystem path to this conversation's WAV recording (see
+        -- app.core.recording), if one was produced. NULL for every chat conversation
+        -- and any voice conversation that failed before its first turn's audio was
+        -- ever produced/received.
+        ALTER TABLE conversations ADD COLUMN IF NOT EXISTS recording_path TEXT;
+
+        -- True iff recording_path contains ONLY the agent's audio (native_ws — that
+        -- protocol drives the caller via text, so no real caller audio ever exists;
+        -- see app.core.recording's docstring). NULL/false for http_json/websocket/
+        -- twilio, which always represent both sides where recorded at all, and for
+        -- every conversation with no recording (meaningless there either way).
+        ALTER TABLE conversations ADD COLUMN IF NOT EXISTS recording_agent_only BOOLEAN;
         """
     )
     conn.commit()
@@ -193,20 +255,57 @@ def insert_agent(
     request_template: str,
     auth_header: str | None = None,
     description: str | None = None,
+    modality: str = "chat",
+    voice_protocol: str = "http_json",
+    http_method: str = "POST",
+    query_param_map: str | None = None,
 ) -> int:
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO agents
            (name, kind, endpoint_url, auth_header, request_template,
-            response_path, description, created_at)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            response_path, description, created_at, modality, voice_protocol,
+            http_method, query_param_map)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (name, kind, endpoint_url, auth_header, request_template,
-         response_path, description, now_iso()),
+         response_path, description, now_iso(), modality, voice_protocol,
+         http_method, query_param_map),
     )
     agent_id = cur.fetchone()["id"]
     conn.commit()
     conn.close()
     return agent_id
+
+
+def update_agent_connection(
+    agent_id: int,
+    auth_header: str | None,
+    request_template: str,
+    response_path: str,
+    modality: str,
+    voice_protocol: str,
+    http_method: str,
+    query_param_map: str | None,
+) -> None:
+    """Refresh a re-registered agent's connection details in place.
+
+    Re-registering the same name+endpoint (POST /agents) reuses the existing row so
+    its customer context and stored test cases stay attached — but that means a
+    corrected auth_header/protocol/create-call body typed on a SECOND attempt was
+    previously discarded silently (only description ever got updated), so a wrong
+    API key or protocol typed on attempt 1 stuck around forever no matter how many
+    times the form was resubmitted. This makes every reconnect attempt authoritative.
+    """
+    conn = get_conn()
+    conn.execute(
+        """UPDATE agents SET auth_header = %s, request_template = %s, response_path = %s,
+           modality = %s, voice_protocol = %s, http_method = %s, query_param_map = %s
+           WHERE id = %s""",
+        (auth_header, request_template, response_path, modality, voice_protocol,
+         http_method, query_param_map, agent_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def update_agent_description(agent_id: int, description: str) -> None:
@@ -356,11 +455,11 @@ def replace_scenarios(run_id: int, scenarios: list[dict]) -> list[int]:
         cur = conn.execute(
             """INSERT INTO scenarios
                (run_id, title, user_goal, test_type, assigned_fault,
-                expected_behavior, seed_turns_json)
-               VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                expected_behavior, seed_turns_json, customer_context, max_turns)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (run_id, s.get("title"), s.get("user_goal"), s.get("test_type"),
              s.get("assigned_fault"), s.get("expected_behavior"),
-             _json.dumps(s.get("seed_turns", []))),
+             _json.dumps(s.get("seed_turns", [])), s.get("customer_context"), s.get("max_turns")),
         )
         ids.append(cur.fetchone()["id"])
     conn.commit()
@@ -512,6 +611,23 @@ def update_conversation_fix(
     conn.close()
 
 
+def set_conversation_recording(conversation_id: int, path: str, agent_only: bool = False) -> None:
+    """Record where this conversation's WAV recording (app.core.recording) landed,
+    and whether it's agent-audio-only (native_ws — see that module's docstring).
+
+    Called exactly once, from app.core.voice_caller.close_voice_session(), only when
+    a recording actually has content to write — see that function and
+    app.core.recording.finalize_recording().
+    """
+    conn = get_conn()
+    conn.execute(
+        "UPDATE conversations SET recording_path = %s, recording_agent_only = %s WHERE id = %s",
+        (path, agent_only, conversation_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def build_conversation_payload(conversation_id: int) -> dict | None:
     """Assemble one conversation for the report: scenario meta + scores + messages+trace."""
     conv = get_conversation(conversation_id)
@@ -557,6 +673,17 @@ def build_conversation_payload(conversation_id: int) -> dict | None:
         "suggested_fix": conv.get("suggested_fix"),
         "evidence": conv.get("evidence"),
         "messages": messages,
+        # A ready-to-use URL, not the raw server filesystem path — GET it from
+        # app.routers.conversations. None whenever no recording exists (chat, or a
+        # voice conversation that failed before any audio was produced/received —
+        # see app.core.recording's docstring).
+        "recording_url": (
+            f"/conversations/{conv['id']}/recording" if conv.get("recording_path") else None
+        ),
+        # True iff recording_url, when present, contains ONLY the agent's audio
+        # (native_ws — see app.core.recording's docstring). Always False/irrelevant
+        # when recording_url is None.
+        "recording_agent_only": bool(conv.get("recording_agent_only")),
     }
 
 
@@ -638,11 +765,11 @@ def get_or_create_customer_agent(customer_id: int, agent_id: int) -> int:
 
 
 def list_customer_agents() -> list[dict]:
-    """Every customer-agent combination, with the customer and agent names joined in."""
+    """Every customer-agent combination, with the customer, agent names, and modality joined in."""
     conn = get_conn()
     rows = conn.execute(
         """SELECT ca.id, ca.customer_id, ca.agent_id,
-                  c.name AS customer_name, a.name AS agent_name
+                  c.name AS customer_name, a.name AS agent_name, a.modality AS agent_modality
            FROM customer_agents ca
            JOIN customers c ON c.id = ca.customer_id
            JOIN agents a    ON a.id = ca.agent_id
@@ -671,11 +798,11 @@ def insert_test_case(customer_agent_id: int, tc: dict, source: str = "ai") -> in
 
 
 def get_customer_agent(customer_agent_id: int) -> dict | None:
-    """One customer-agent combination with the customer and agent names joined in."""
+    """One customer-agent combination with the customer, agent names, and modality joined in."""
     conn = get_conn()
     row = conn.execute(
         """SELECT ca.id, ca.customer_id, ca.agent_id,
-                  c.name AS customer_name, a.name AS agent_name
+                  c.name AS customer_name, a.name AS agent_name, a.modality AS agent_modality
            FROM customer_agents ca
            JOIN customers c ON c.id = ca.customer_id
            JOIN agents a    ON a.id = ca.agent_id
@@ -731,11 +858,12 @@ def replace_test_cases(customer_agent_id: int, cases: list[dict], sources: list[
         conn.execute(
             """INSERT INTO test_cases
                (customer_agent_id, title, user_goal, test_type, assigned_fault,
-                expected_behavior, seed_turns_json, source, created_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                expected_behavior, seed_turns_json, source, created_at, customer_context, max_turns)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (customer_agent_id, tc.get("title"), tc.get("user_goal"), tc.get("test_type"),
              tc.get("assigned_fault"), tc.get("expected_behavior"),
-             _json.dumps(tc.get("seed_turns", [])), source, ts),
+             _json.dumps(tc.get("seed_turns", [])), source, ts,
+             tc.get("customer_context"), tc.get("max_turns")),
         )
     conn.commit()
     conn.close()

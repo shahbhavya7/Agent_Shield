@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AgentShield — start everything with one command.
 #   ./run_all.sh
-# Starts: backend (8000), 6 sample agents (8002-8007), and the frontend (3000).
+# Starts: backend (8100), 6 sample agents (8002-8007), and the frontend (3000).
 # Ctrl-C stops them all.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +16,7 @@ cleanup() {
   echo "Stopping AgentShield…"
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
   # free the ports in case anything lingers
-  for p in 8000 8002 8003 8004 8005 8006 8007 3000 7233 8233; do lsof -ti:$p | xargs kill 2>/dev/null; done
+  for p in 8100 8002 8003 8004 8005 8006 8007 3000 7233 8233; do lsof -ti:$p | xargs kill 2>/dev/null; done
   exit 0
 }
 trap cleanup INT TERM
@@ -37,7 +37,7 @@ start_agent() { # name module port
 }
 
 echo "Starting AgentShield services…"
-start_agent "Backend (AgentShield API)"      "app.main:app"                 8000
+start_agent "Backend (AgentShield API)"      "app.main:app"                 8100
 start_agent "Store Support agent"            "sample_rag_bot.main:app"      8002
 start_agent "NorthBank (banking) agent"      "sample_agents.banking:app"    8003
 start_agent "PeopleDesk (HR) agent"          "sample_agents.hr:app"         8004
@@ -72,7 +72,7 @@ cat <<EOF
 ────────────────────────────────────────────────────────────
 AgentShield is up:
   • App (open this):     http://localhost:3000
-  • Backend API:         http://localhost:8000/health
+  • Backend API:         http://localhost:8100/health
   Agents under test (each has its own chat UI at its root):
   • Store Support:       http://localhost:8002/
   • NorthBank (banking): http://localhost:8003/

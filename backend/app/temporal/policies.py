@@ -48,6 +48,7 @@ from app.core.activities import (
     load_replay_context,
     persist_suite,
     play_scenario,
+    play_voice_scenario,
     prepare_scenarios,
     replay_scenario,
 )
@@ -204,6 +205,19 @@ _OPTIONS: dict[str, dict[str, Any]] = {
         "schedule_to_close_timeout": timedelta(minutes=15),
         "retry_policy": _EXPENSIVE,
     },
+    "play_voice_scenario": {
+        # idempotency: VERIFIED — same run_scenario() as play_scenario, keyed the same
+        # way (conversations.idem_key), so the same guarantees apply (see play_scenario's
+        # note above). Phase 2B: each turn now also does a TTS + STT round trip (via
+        # app.core.voice_caller) around the same HTTP call chat uses — a few extra
+        # seconds per turn, still comfortably inside this budget for a short scenario.
+        # Revisit if scenarios grow long enough to approach it, or once a real
+        # streaming/telephony transport has different failure characteristics (e.g. it
+        # needs to heartbeat — see the module docstring).
+        "start_to_close_timeout": timedelta(minutes=5),
+        "schedule_to_close_timeout": timedelta(minutes=15),
+        "retry_policy": _EXPENSIVE,
+    },
     "replay_scenario": {
         # idempotency: NONE, deliberately. It exists to produce a NEW conversation, so a
         # retry would leave a spurious extra one behind. Exactly one attempt; a failed
@@ -243,6 +257,7 @@ ALL_ACTIVITIES: list[Callable[..., Any]] = [
     prepare_scenarios,
     persist_suite,
     play_scenario,
+    play_voice_scenario,
     replay_scenario,
     judge_conversation_by_id,
     explain_conversation_by_id,
