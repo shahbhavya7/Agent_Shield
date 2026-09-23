@@ -33,7 +33,6 @@ import {
   Check,
   Upload,
   FileText,
-  FileCode2,
   X,
   ListChecks,
   Plus,
@@ -43,6 +42,7 @@ import {
   Save,
   MessageSquare,
   Mic,
+  Workflow,
 } from "lucide-react";
 import {
   API_BASE,
@@ -53,6 +53,7 @@ import {
   getRunGroup,
   getDemoReport,
   getStoredTestCases,
+  getAgentFlows,
   saveTestCases,
   generateOneScenario,
   probeAgent,
@@ -179,7 +180,10 @@ const fadeStep = {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function prettify(type?: string): string {
+// Exported (Phase 3) so frontend/app/flows/page.tsx can reuse the same result view
+// for a flow-node test's run instead of duplicating it — these are pure presentational
+// components with no dependency on this page's own state.
+export function prettify(type?: string): string {
   const map: Record<string, string> = {
     happy_path: "Happy Path",
     support: "Tool / Support",
@@ -192,7 +196,7 @@ function prettify(type?: string): string {
   return map[type || ""] || (type || "General");
 }
 
-function TraceChips({ trace }: { trace: Trace }) {
+export function TraceChips({ trace }: { trace: Trace }) {
   const chips: { key: string; label: string; tone: "ok" | "bad" | "warn" | "muted" }[] = [];
   (trace.tool_calls || []).forEach((tc, i) =>
     chips.push({ key: `t${i}`, label: `🔧 ${tc.name} ${tc.ok === false ? "✕ failed" : "✓"}`, tone: tc.ok === false ? "bad" : "ok" })
@@ -221,7 +225,7 @@ function TraceChips({ trace }: { trace: Trace }) {
   );
 }
 
-function Transcript({ messages }: { messages: Message[] }) {
+export function Transcript({ messages }: { messages: Message[] }) {
   if (!messages?.length) return <p className="mt-3 text-xs text-slate-500">No transcript recorded.</p>;
   return (
     <div className="mt-3 flex flex-col gap-2">
@@ -246,7 +250,7 @@ function Transcript({ messages }: { messages: Message[] }) {
 // Reuses the SAME `messages`/verdict data the transcript already renders from —
 // recording_url is just one more field on that same conversation payload
 // (backend/app/db.py's build_conversation_payload), nothing new fetched here.
-function RecordingPlayer({
+export function RecordingPlayer({
   url,
   agentOnly,
 }: {
@@ -276,7 +280,7 @@ function RecordingPlayer({
   );
 }
 
-function TranscriptDetails({
+export function TranscriptDetails({
   messages,
   label,
   recordingUrl,
@@ -349,8 +353,6 @@ export default function DashboardPage() {
   // was given at all.
   const [knowledgeText, setKnowledgeText] = useState("");
   const [knowledgeFile, setKnowledgeFile] = useState("");
-  const [knowledgeYamlText, setKnowledgeYamlText] = useState("");
-  const [knowledgeYamlFile, setKnowledgeYamlFile] = useState("");
   const [aboutText, setAboutText] = useState("");
   const [detected, setDetected] = useState(""); // description AgentShield auto-discovered
 
@@ -366,24 +368,15 @@ export default function DashboardPage() {
   };
   const clearUpload = () => { setKnowledgeText(""); setKnowledgeFile(""); };
 
-  const onUploadYaml = async (file: File | undefined) => {
-    if (!file) return;
-    try {
-      const text = await file.text();
-      setKnowledgeYamlText(text.slice(0, MAX_KNOWLEDGE_CHARS));
-      setKnowledgeYamlFile(file.name);
-    } catch {
-      setError("Couldn't read that file — please use a YAML file.");
-    }
-  };
-  const clearUploadYaml = () => { setKnowledgeYamlText(""); setKnowledgeYamlFile(""); };
-
-  // What actually gets sent as "knowledge" to the backend — every uploaded source
-  // concatenated, since the generator/judge just treat it as one authoritative text block.
-  const combinedKnowledgeText = [knowledgeText, knowledgeYamlText]
-    .filter((t) => t.trim().length > 0)
-    .join("\n\n---\n\n");
-  const combinedKnowledgeName = [knowledgeFile, knowledgeYamlFile].filter(Boolean).join(" + ");
+  // What gets sent as "knowledge" to the backend. Kept as its own name (rather than
+  // renaming every call site to knowledgeText/knowledgeFile) — there is no separate
+  // YAML-as-knowledge upload here: a Voice Agent's flow definition is a different
+  // concept, uploaded separately under Flow-Based Scripts after connecting.
+  const combinedKnowledgeText = knowledgeText;
+  const combinedKnowledgeName = knowledgeFile;
+  // Agent Knowledge is required (both modalities) — satisfied by EITHER an uploaded
+  // doc or a non-empty description, never both.
+  const hasKnowledge = combinedKnowledgeText.trim().length > 0 || aboutText.trim().length > 0;
 
   const [verifyIndex, setVerifyIndex] = useState(0);
   const [selectedTests, setSelectedTests] = useState<string[]>(
@@ -398,6 +391,11 @@ export default function DashboardPage() {
   // `reports` while looking at results.
   const [activeIdx, setActiveIdx] = useState(0);
   const [agentId, setAgentId] = useState<number | null>(null);
+  // Whether the connected voice agent already has an uploaded flow definition — shown
+  // as a status hint on the "Flow-Based Scripts" card so the user knows up front
+  // whether the next screen will ask for an upload or just show the existing flow.
+  // null = unknown yet / not applicable (chat agent).
+  const [agentHasFlow, setAgentHasFlow] = useState<boolean | null>(null);
   // A group is the batch of runs launched together: one run per selected agent.
   const [groupId, setGroupId] = useState<number | null>(null);
   const [groupRuns, setGroupRuns] = useState<GroupRun[]>([]);
@@ -411,6 +409,11 @@ export default function DashboardPage() {
   const [generating, setGenerating] = useState(false);
   const [starting, setStarting] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Re-fetch this agent's stored suite from the server (read-only — never generates or
+  // saves anything). Exists because the review step only loads suites.[i] once, on
+  // mount (see the effect below); a test case saved elsewhere in the meantime — e.g. a
+  // flow-node test saved from /flows — has no way to invalidate that snapshot on its own.
+  const [refreshingTestCases, setRefreshingTestCases] = useState(false);
   const [savedNote, setSavedNote] = useState<string | null>(null);
   const [editing, setEditing] = useState<ReviewCase | null>(null); // add/edit modal draft
   const [editingIsNew, setEditingIsNew] = useState(false);
@@ -441,6 +444,27 @@ export default function DashboardPage() {
       return copy;
     });
 
+  // Whether the connected voice agent already has an uploaded flow — powers the status
+  // hint on the "Flow-Based Scripts" card (Part 10). Read-only, same GET the /flows
+  // page itself uses to decide whether to show its upload control or the existing flow.
+  useEffect(() => {
+    if (!agentId || modality !== "voice") {
+      setAgentHasFlow(null);
+      return;
+    }
+    let cancelled = false;
+    getAgentFlows(agentId)
+      .then((r) => {
+        if (!cancelled) setAgentHasFlow(r.flows.length > 0);
+      })
+      .catch(() => {
+        if (!cancelled) setAgentHasFlow(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId, modality]);
+
   // Switch which agent is being reviewed. agentId follows, because generation and saving
   // always act on the agent on screen.
   const selectTarget = (i: number) => {
@@ -450,6 +474,28 @@ export default function DashboardPage() {
     setAgentId(t.agentId);
     setSavedNote(null);
     setError(null);
+  };
+
+  // Reload the ACTIVE agent's stored suite from the server and replace suites[activeIdx]
+  // with exactly what the server has — read-only, same GET the initial load already
+  // uses (getStoredTestCases -> GET /inventory/{customerAgentId}/test-cases), so a test
+  // case saved from anywhere else (e.g. a flow-node test saved from /flows) appears
+  // without navigating away and back. Never calls saveTestCases/replace_test_cases.
+  const refreshTestCases = async () => {
+    if (!context?.customerAgentId || refreshingTestCases) return;
+    setRefreshingTestCases(true);
+    setError(null);
+    try {
+      const stored = await getStoredTestCases(context.customerAgentId);
+      const fresh: ReviewCase[] = stored.scenarios.map((sc) => ({
+        ...sc, uid: nextUid(), source: sc.source || "ai",
+      }));
+      setTestCases(fresh); // writes into suites[activeIdx] — activeIdx itself is untouched
+    } catch (e) {
+      setError(`Couldn't refresh test cases: ${(e as Error).message}`);
+    } finally {
+      setRefreshingTestCases(false);
+    }
   };
 
   const selectReport = (i: number) => {
@@ -610,6 +656,10 @@ export default function DashboardPage() {
   // --- Verify: register + real probe, with a staged animation ---
   const handleVerifyConnection = async () => {
     if (!canVerify) return;
+    if (!hasKnowledge) {
+      setError("Agent Knowledge is required. Upload a knowledge file or describe your agent.");
+      return;
+    }
     setError(null);
     setStep("verifying");
     setVerifyIndex(0);
@@ -1135,10 +1185,18 @@ export default function DashboardPage() {
 
                   <div>
                     <label className="text-xs font-medium text-[#9CA3AF]">
-                      Agent knowledge <span className="text-slate-600">(optional — upload docs, upload a YAML config, or describe the agent)</span>
+                      Agent Knowledge <span className="text-[#FBBF24]">(required)</span>
                     </label>
+                    <p className="mt-1 text-xs text-slate-500">
+                      Documents, instructions, FAQs, or configuration used to help
+                      AgentShield understand and test your agent — not your voice
+                      agent&apos;s flow definition. If you want node-by-node scripted
+                      tests, upload the flow separately under{" "}
+                      <span className="text-[#9CA3AF]">Flow-Based Scripts</span> after
+                      connecting.
+                    </p>
 
-                    {/* Tier 1a: upload docs */}
+                    {/* Satisfied by EITHER this upload OR the description below. */}
                     {!knowledgeFile ? (
                       <label className="mt-2 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-white/20 bg-white/2 px-4 py-4 text-sm text-slate-400 transition-colors hover:border-white/40 hover:text-[#F8FAFC]">
                         <Upload className="h-5 w-5 shrink-0" strokeWidth={1.5} />
@@ -1159,29 +1217,7 @@ export default function DashboardPage() {
                       </div>
                     )}
 
-                    {/* Tier 1b: upload a YAML config — independent of the docs upload above */}
-                    {!knowledgeYamlFile ? (
-                      <label className="mt-3 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed border-white/20 bg-white/2 px-4 py-4 text-sm text-slate-400 transition-colors hover:border-white/40 hover:text-[#F8FAFC]">
-                        <FileCode2 className="h-5 w-5 shrink-0" strokeWidth={1.5} />
-                        <span>Upload a YAML config <span className="text-slate-600">(.yaml, .yml)</span></span>
-                        <input
-                          type="file"
-                          accept=".yaml,.yml"
-                          className="hidden"
-                          onChange={(e) => onUploadYaml(e.target.files?.[0])}
-                        />
-                      </label>
-                    ) : (
-                      <div className="mt-3 flex items-center gap-3 rounded-lg border border-[#34D399]/30 bg-[#34D399]/[0.06] px-4 py-3 text-sm">
-                        <FileCode2 className="h-5 w-5 shrink-0 text-[#34D399]" strokeWidth={1.5} />
-                        <span className="flex-1 truncate text-[#F8FAFC]">{knowledgeYamlFile}</span>
-                        <span className="text-xs text-slate-500">{knowledgeYamlText.length.toLocaleString()} chars</span>
-                        <button onClick={clearUploadYaml} className="text-slate-400 hover:text-[#F87171]"><X className="h-4 w-4" /></button>
-                      </div>
-                    )}
-
-                    {/* Tier 2: free-text about (only if nothing was uploaded) */}
-                    {!knowledgeFile && !knowledgeYamlFile && (
+                    {!knowledgeFile && (
                       <textarea
                         value={aboutText}
                         onChange={(e) => setAboutText(e.target.value)}
@@ -1311,22 +1347,77 @@ export default function DashboardPage() {
                     />
                   </div>
 
-                  <motion.button
-                    whileHover={{ scale: canGenerate ? 1.02 : 1 }}
-                    whileTap={{ scale: canGenerate ? 0.98 : 1 }}
-                    transition={{ duration: 0.3 }}
-                    onClick={() => handleGenerate(false)}
-                    disabled={!canGenerate}
-                    className="mt-8 flex w-full items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-8 py-4 text-base font-medium text-[#F8FAFC] backdrop-blur-md transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:shadow-none"
-                  >
-                    {generating ? <Loader2 className="h-5 w-5 animate-spin" strokeWidth={1.5} /> : <ListChecks className="h-5 w-5" strokeWidth={1.5} />}
-                    {generating ? "Generating test cases…" : "View Test Cases"}
-                  </motion.button>
-                  <p className="mt-3 text-center text-xs text-slate-500">
-                    {testCases.length > 0 && suiteConfig === currentConfig()
-                      ? `Reopens your ${testCases.length}-case suite — change a selection above to generate a new one.`
-                      : "You'll review, edit, and approve the generated test cases before anything runs."}
-                  </p>
+                  {modality === "voice" ? (
+                    <>
+                      <p className="mt-8 text-sm font-medium text-[#F8FAFC]">
+                        How would you like to test this agent?
+                      </p>
+                      <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                        <button
+                          onClick={() => handleGenerate(false)}
+                          disabled={!canGenerate}
+                          className="flex flex-col items-start gap-2 rounded-xl border border-white/20 bg-white/4 p-6 text-left backdrop-blur-md transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:shadow-none"
+                        >
+                          <div className="flex items-center gap-2 text-[#F8FAFC]">
+                            {generating ? <Loader2 className="h-5 w-5 animate-spin" strokeWidth={1.5} /> : <ListChecks className="h-5 w-5" strokeWidth={1.5} />}
+                            <span className="font-heading text-base font-medium">Conversational Test Cases</span>
+                          </div>
+                          <p className="text-xs text-[#9CA3AF]">
+                            {generating
+                              ? "Generating test cases…"
+                              : testCases.length > 0 && suiteConfig === currentConfig()
+                              ? `Reopens your ${testCases.length}-case suite for review.`
+                              : "AI-generated adversarial scenarios — memory, injection, hallucination, contradiction, and more."}
+                          </p>
+                        </button>
+
+                        <button
+                          onClick={() => router.push(`/flows${agentId ? `?agentId=${agentId}` : ""}`)}
+                          className="flex flex-col items-start gap-2 rounded-xl border border-white/20 bg-white/4 p-6 text-left backdrop-blur-md transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)]"
+                        >
+                          <div className="flex w-full items-center gap-2 text-[#F8FAFC]">
+                            <Workflow className="h-5 w-5" strokeWidth={1.5} />
+                            <span className="font-heading text-base font-medium">Flow-Based Scripts</span>
+                            {agentHasFlow != null && (
+                              <span
+                                className={`ml-auto rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${
+                                  agentHasFlow
+                                    ? "border-emerald-400/40 text-emerald-300"
+                                    : "border-white/15 text-slate-400"
+                                }`}
+                              >
+                                {agentHasFlow ? "Flow available" : "No flow uploaded"}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-xs text-[#9CA3AF]">
+                            {agentHasFlow
+                              ? "Reuses the flow already uploaded for this agent — pick a node and generate its script."
+                              : "Upload your agent's JSON/YAML flow definition to analyze its nodes and generate node-specific test scripts."}
+                          </p>
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <motion.button
+                        whileHover={{ scale: canGenerate ? 1.02 : 1 }}
+                        whileTap={{ scale: canGenerate ? 0.98 : 1 }}
+                        transition={{ duration: 0.3 }}
+                        onClick={() => handleGenerate(false)}
+                        disabled={!canGenerate}
+                        className="mt-8 flex w-full items-center justify-center gap-2 rounded-full border border-white/20 bg-white/4 px-8 py-4 text-base font-medium text-[#F8FAFC] backdrop-blur-md transition-all duration-300 hover:border-white/40 hover:bg-white/12 hover:shadow-[0_0_32px_rgba(255,255,255,0.2)] disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:shadow-none"
+                      >
+                        {generating ? <Loader2 className="h-5 w-5 animate-spin" strokeWidth={1.5} /> : <ListChecks className="h-5 w-5" strokeWidth={1.5} />}
+                        {generating ? "Generating test cases…" : "View Test Cases"}
+                      </motion.button>
+                      <p className="mt-3 text-center text-xs text-slate-500">
+                        {testCases.length > 0 && suiteConfig === currentConfig()
+                          ? `Reopens your ${testCases.length}-case suite — change a selection above to generate a new one.`
+                          : "You'll review, edit, and approve the generated test cases before anything runs."}
+                      </p>
+                    </>
+                  )}
                 </div>
               </div>
             </motion.section>
@@ -1363,13 +1454,24 @@ export default function DashboardPage() {
                         </p>
                       )}
                     </div>
-                    <button
-                      onClick={() => setStep("configure")}
-                      disabled={generating || starting}
-                      className="rounded-full border border-white/15 bg-white/4 px-4 py-2 text-xs font-medium text-slate-300 transition-all hover:border-white/30 hover:text-[#F8FAFC] disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      ← Back to Configure
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={refreshTestCases}
+                        disabled={!context?.customerAgentId || refreshingTestCases || generating || starting}
+                        title="Reload this agent's saved test cases from the server"
+                        className="flex items-center gap-1.5 rounded-full border border-white/15 bg-white/4 px-4 py-2 text-xs font-medium text-slate-300 transition-all hover:border-white/30 hover:text-[#F8FAFC] disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <RefreshCcw className={`h-3.5 w-3.5 ${refreshingTestCases ? "animate-spin" : ""}`} strokeWidth={1.5} />
+                        {refreshingTestCases ? "Refreshing…" : "Refresh"}
+                      </button>
+                      <button
+                        onClick={() => setStep("configure")}
+                        disabled={generating || starting}
+                        className="rounded-full border border-white/15 bg-white/4 px-4 py-2 text-xs font-medium text-slate-300 transition-all hover:border-white/30 hover:text-[#F8FAFC] disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        ← Back to Configure
+                      </button>
+                    </div>
                   </div>
 
                   {/* One tab per selected agent — each owns its own test-case suite. */}

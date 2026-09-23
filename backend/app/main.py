@@ -36,10 +36,11 @@ def health() -> dict:
     return {"ok": True}
 
 
-from app.routers import agents, conversations, inventory, runs, twilio  # noqa: E402
+from app.routers import agents, conversations, flows, inventory, runs, twilio  # noqa: E402
 
 app.include_router(runs.router)
 app.include_router(agents.router)
 app.include_router(conversations.router)
 app.include_router(inventory.router)
 app.include_router(twilio.router)
+app.include_router(flows.router)

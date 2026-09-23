@@ -11,7 +11,10 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     let detail = res.statusText;
     try {
       const body = await res.json();
-      detail = body.detail || detail;
+      // `detail` is usually a plain string, but a structured error (e.g. flow
+      // validation's {errors: [...]}) is stringified instead of rendering as
+      // "[object Object]".
+      detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail) || detail;
     } catch {
       /* ignore */
     }
@@ -202,6 +205,12 @@ export function registerAgent(body: {
   return req("/agents", { method: "POST", body: JSON.stringify(body) });
 }
 
+// One agent by id. Used to look up an agent that was just connected but has no
+// customer_agents row yet, so it wouldn't otherwise show up in getInventory().
+export function getAgent(agentId: number): Promise<Agent> {
+  return req(`/agents/${agentId}`);
+}
+
 export function probeAgent(agentId: number): Promise<{ ok: boolean; reply: string; error?: string | null }> {
   return req(`/agents/${agentId}/probe`, { method: "POST" });
 }
@@ -319,6 +328,142 @@ export function saveTestCases(
 }
 
 // Generate ONE test case from the user's description (Add Test Case → Generate with AI).
+// ---- flow-aware / node-based voice testing (Phase 1: upload + parse + display only) ----
+export interface FlowNode {
+  id: string;
+  name: string;
+  type: string;
+  purpose: string;
+  expected_inputs: string[];
+  // Where this node was found in the uploaded file, e.g. "flow.steps[2]" — only set
+  // for deterministic extraction; omitted for LLM-extracted nodes (no evidence to cite).
+  source_path?: string | null;
+}
+
+export interface FlowEdge {
+  from: string;
+  to: string;
+}
+
+// How a flow's nodes/edges were derived from its raw_source — see
+// backend/app/core/flow_parser.py / flow_llm_extractor.py.
+export type ExtractionMethod = "deterministic" | "llm";
+
+export interface FlowSummary {
+  id: number;
+  agent_id: number;
+  name: string;
+  source_format: "json" | "yaml";
+  created_at: string;
+  extraction_method?: ExtractionMethod;
+}
+
+export interface FlowDetail extends FlowSummary {
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+}
+
+export interface UploadFlowResult {
+  flow_id: number;
+  agent_id: number;
+  name: string;
+  agent_name: string;
+  source_format: "json" | "yaml";
+  extraction_method?: ExtractionMethod;
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+}
+
+// Upload+parse a flow definition. `content` is the file's text, read client-side —
+// same convention as saveAgentKnowledge — but unlike knowledge, this content IS
+// actually parsed and validated server-side (see backend/app/core/flow_parser.py).
+export function uploadAgentFlow(
+  agentId: number,
+  content: string,
+  filename: string
+): Promise<UploadFlowResult> {
+  return req(`/agents/${agentId}/flows`, {
+    method: "POST",
+    body: JSON.stringify({ content, filename }),
+  });
+}
+
+export function getAgentFlows(agentId: number): Promise<{ flows: FlowSummary[] }> {
+  return req(`/agents/${agentId}/flows`);
+}
+
+export function getFlow(flowId: number): Promise<FlowDetail> {
+  return req(`/flows/${flowId}`);
+}
+
+// ---- Phase 2: node test goal + deterministic script (generation only, not persisted) ----
+export interface NodeScriptTurn {
+  expected_agent_behavior: string;
+  caller_line: string;
+}
+
+export interface GeneratedNodeScript {
+  flow_id: number;
+  node_id: string;
+  node_name: string;
+  test_goal: string;
+  script: NodeScriptTurn[];
+}
+
+// Generate a test goal + deterministic caller script for one node. `testGoal`, if
+// given, seeds the intent (e.g. "test an incorrect name before the correct one");
+// omit it to have the node's own purpose drive what gets generated. Draft only —
+// nothing is persisted until the script is reviewed and saved in a later phase.
+export function generateNodeScript(
+  flowId: number,
+  nodeId: string,
+  testGoal?: string
+): Promise<GeneratedNodeScript> {
+  return req(`/flows/${flowId}/nodes/${encodeURIComponent(nodeId)}/script`, {
+    method: "POST",
+    body: JSON.stringify({ test_goal: testGoal || null }),
+  });
+}
+
+// ---- Phase 3: persist the reviewed script as a real test case, then run it ----
+export interface SavedNodeTest {
+  test_id: number;
+  flow_id: number;
+  node_id: string;
+  node_name: string;
+  customer_agent_id: number;
+  test_goal: string;
+  script: NodeScriptTurn[];
+}
+
+// Save the reviewed goal+script as a real, persistent test case (existing test_cases
+// table) — a single addition, it never touches any other test case saved for this
+// agent. This is what makes the node test runnable afterward.
+export function saveNodeTest(
+  flowId: number,
+  nodeId: string,
+  testGoal: string,
+  script: NodeScriptTurn[]
+): Promise<SavedNodeTest> {
+  return req(`/flows/${flowId}/nodes/${encodeURIComponent(nodeId)}/test`, {
+    method: "POST",
+    body: JSON.stringify({ test_goal: testGoal, script }),
+  });
+}
+
+// Start a saved node test through the existing Temporal run pipeline — the response
+// is the same run_id/group_id shape POST /runs already returns, pollable with the
+// existing getRun/getReport below.
+export function runNodeTest(
+  flowId: number,
+  nodeId: string,
+  testId: number
+): Promise<{ run_id: number; group_id: number; flow_id: number; node_id: string; test_id: number }> {
+  return req(`/flows/${flowId}/nodes/${encodeURIComponent(nodeId)}/tests/${testId}/run`, {
+    method: "POST",
+  });
+}
+
 export function generateOneScenario(
   agentId: number,
   description: string,

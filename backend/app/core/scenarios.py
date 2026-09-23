@@ -23,6 +23,12 @@ from app.core.llm import chat
 VALID_TYPES = {
     "support", "memory", "injection", "contradiction", "hallucination", "system_failure",
     "happy_path",
+    # Flow-aware / node-based voice testing (Phase 3, app.core.node_script): a
+    # deterministic scripted test authored from one flow node rather than generated
+    # here. Listed so _normalize() (used by the existing save/run endpoints this
+    # feature reuses) doesn't silently downgrade it back to "support" — it must reach
+    # app.core.runner as "flow_node" so it never enters ADAPTIVE_TYPES there.
+    "flow_node",
 }
 VALID_FAULTS = {
     "none", "tool_timeout", "stale_doc", "injection",
