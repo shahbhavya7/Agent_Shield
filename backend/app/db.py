@@ -214,6 +214,50 @@ def init_schema() -> None:
         -- twilio, which always represent both sides where recorded at all, and for
         -- every conversation with no recording (meaningless there either way).
         ALTER TABLE conversations ADD COLUMN IF NOT EXISTS recording_agent_only BOOLEAN;
+
+        -- Flow-aware / node-based voice testing — Phase 1 only (upload, parse, store,
+        -- display; nothing here is wired to execution yet). One row per uploaded flow
+        -- definition version for an agent: re-uploading a corrected flow adds a new row
+        -- rather than overwriting, so earlier versions stay available. Nodes/edges are
+        -- JSON-in-TEXT, matching this schema's existing style (seed_turns_json,
+        -- breakdown_json, ...) rather than a normalized graph schema — a handful of
+        -- nodes per flow doesn't warrant one.
+        CREATE TABLE IF NOT EXISTS agent_flows (
+            id             SERIAL PRIMARY KEY,
+            agent_id       INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            name           TEXT NOT NULL,
+            source_format  TEXT NOT NULL,   -- json | yaml
+            raw_source     TEXT NOT NULL,
+            nodes_json     TEXT NOT NULL,
+            edges_json     TEXT NOT NULL,
+            created_at     TEXT NOT NULL
+        );
+
+        -- How this row's nodes_json/edges_json were derived from raw_source: 'deterministic'
+        -- (app.core.flow_parser's alias/wrapper scanner) or 'llm' (app.core.flow_llm_extractor,
+        -- used only when the scanner found nothing confident). NULL for rows written before
+        -- this column existed — treated as 'deterministic' by callers, since that was the
+        -- only path back then. No separate "version" column: id + created_at (already
+        -- ordered newest-first by list_agent_flows) are sufficient.
+        ALTER TABLE agent_flows ADD COLUMN IF NOT EXISTS extraction_method TEXT;
+
+        -- Phase 2: which flow/node a scenario or test case was authored from, and the
+        -- rich per-turn script it was authored WITH (expected_agent_behavior +
+        -- caller_line per turn — see app.core.node_script). NULL for every scenario
+        -- that predates this feature or wasn't authored from a flow. A later phase
+        -- flattens node_script_json into this row's existing seed_turns_json (the
+        -- caller_line values, in order) and expected_behavior (the
+        -- expected_agent_behavior values, numbered) so the EXISTING scripted runner
+        -- and Judge play/grade it unchanged; node_script_json itself is kept only so
+        -- the per-turn structure stays editable/redisplayable later.
+        ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS flow_id
+            INTEGER REFERENCES agent_flows(id);
+        ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS node_id TEXT;
+        ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS node_script_json TEXT;
+        ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS flow_id
+            INTEGER REFERENCES agent_flows(id);
+        ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS node_id TEXT;
+        ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS node_script_json TEXT;
         """
     )
     conn.commit()
@@ -455,11 +499,16 @@ def replace_scenarios(run_id: int, scenarios: list[dict]) -> list[int]:
         cur = conn.execute(
             """INSERT INTO scenarios
                (run_id, title, user_goal, test_type, assigned_fault,
-                expected_behavior, seed_turns_json, customer_context, max_turns)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                expected_behavior, seed_turns_json, customer_context, max_turns,
+                flow_id, node_id, node_script_json)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (run_id, s.get("title"), s.get("user_goal"), s.get("test_type"),
              s.get("assigned_fault"), s.get("expected_behavior"),
-             _json.dumps(s.get("seed_turns", [])), s.get("customer_context"), s.get("max_turns")),
+             _json.dumps(s.get("seed_turns", [])), s.get("customer_context"), s.get("max_turns"),
+             # Phase 3 (flow-node tests only): which flow/node this scenario was authored
+             # from, and its rich per-turn script. None/NULL for every ordinary scenario,
+             # which simply doesn't carry these keys — no behavior change for them.
+             s.get("flow_id"), s.get("node_id"), s.get("node_script_json")),
         )
         ids.append(cur.fetchone()["id"])
     conn.commit()
@@ -779,22 +828,45 @@ def list_customer_agents() -> list[dict]:
     return rows
 
 
-def insert_test_case(customer_agent_id: int, tc: dict, source: str = "ai") -> int:
-    """Store one generated/edited test case against a customer-agent combination."""
+def insert_test_case(
+    customer_agent_id: int,
+    tc: dict,
+    source: str = "ai",
+    flow_id: int | None = None,
+    node_id: str | None = None,
+    node_script_json: str | None = None,
+) -> int:
+    """Store one generated/edited test case against a customer-agent combination.
+
+    A single INSERT — it never touches any other test case already saved for this
+    combination (contrast replace_test_cases, which replaces the whole suite).
+    `flow_id`/`node_id`/`node_script_json` are set only for a flow-node test (Phase 3);
+    every other caller omits them and the row keeps them NULL, unchanged from before
+    these columns existed.
+    """
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO test_cases
            (customer_agent_id, title, user_goal, test_type, assigned_fault,
-            expected_behavior, seed_turns_json, source, created_at)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            expected_behavior, seed_turns_json, source, created_at,
+            flow_id, node_id, node_script_json)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
         (customer_agent_id, tc.get("title"), tc.get("user_goal"), tc.get("test_type"),
          tc.get("assigned_fault"), tc.get("expected_behavior"),
-         _json.dumps(tc.get("seed_turns", [])), source, now_iso()),
+         _json.dumps(tc.get("seed_turns", [])), source, now_iso(),
+         flow_id, node_id, node_script_json),
     )
     tid = cur.fetchone()["id"]
     conn.commit()
     conn.close()
     return tid
+
+
+def get_test_case(test_case_id: int) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM test_cases WHERE id = %s", (test_case_id,)).fetchone()
+    conn.close()
+    return row
 
 
 def get_customer_agent(customer_agent_id: int) -> dict | None:
@@ -808,6 +880,29 @@ def get_customer_agent(customer_agent_id: int) -> dict | None:
            JOIN agents a    ON a.id = ca.agent_id
            WHERE ca.id = %s""",
         (customer_agent_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def get_customer_agent_by_agent_id(agent_id: int) -> dict | None:
+    """The first customer-agent context for this agent, if one already exists.
+
+    Same joined shape as get_customer_agent, filtered by agent instead of by combo id.
+    Used when saving a flow-node test (Phase 3) so it attaches to a genuine existing
+    customer context when there is one, rather than unconditionally minting a new
+    "New Customer N" the way default_customer_agent does for an agent with none yet.
+    """
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT ca.id, ca.customer_id, ca.agent_id,
+                  c.name AS customer_name, a.name AS agent_name, a.modality AS agent_modality
+           FROM customer_agents ca
+           JOIN customers c ON c.id = ca.customer_id
+           JOIN agents a    ON a.id = ca.agent_id
+           WHERE ca.agent_id = %s
+           ORDER BY ca.id LIMIT 1""",
+        (agent_id,),
     ).fetchone()
     conn.close()
     return row
@@ -878,6 +973,55 @@ def get_test_cases(customer_agent_id: int) -> list[dict]:
     ).fetchall()
     conn.close()
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Flow-aware / node-based voice testing — Phase 1 (upload/parse/store/display only).
+# ---------------------------------------------------------------------------
+def insert_agent_flow(
+    agent_id: int,
+    name: str,
+    source_format: str,
+    raw_source: str,
+    nodes: list[dict],
+    edges: list[dict],
+    extraction_method: str = "deterministic",
+) -> int:
+    """Store one uploaded+parsed flow definition as a new version for this agent."""
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO agent_flows
+           (agent_id, name, source_format, raw_source, nodes_json, edges_json,
+            created_at, extraction_method)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (agent_id, name, source_format, raw_source,
+         _json.dumps(nodes), _json.dumps(edges), now_iso(), extraction_method),
+    )
+    flow_id = cur.fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return flow_id
+
+
+def list_agent_flows(agent_id: int) -> list[dict]:
+    """Every uploaded flow version for this agent, newest first. No nodes/edges payload
+    — callers wanting those fetch the single flow via get_agent_flow.
+    """
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT id, agent_id, name, source_format, created_at, extraction_method
+           FROM agent_flows WHERE agent_id = %s ORDER BY id DESC""",
+        (agent_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_agent_flow(flow_id: int) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM agent_flows WHERE id = %s", (flow_id,)).fetchone()
+    conn.close()
+    return row
 
 
 if __name__ == "__main__":
